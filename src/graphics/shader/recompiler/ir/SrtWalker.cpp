@@ -87,6 +87,22 @@ bool ApplyOperation(ScalarValueOp op, const std::array<uint32_t, 3>& args, uint3
 			                                                 : static_cast<uint32_t>(value >> 32u);
 			break;
 		}
+		case ScalarValueOp::ShiftLeftU64Low:
+		case ScalarValueOp::ShiftLeftU64High: {
+			const auto value = (static_cast<uint64_t>(args[1]) << 32u | args[0])
+			                   << (args[2] & 63u);
+			result = op == ScalarValueOp::ShiftLeftU64Low ? static_cast<uint32_t>(value)
+			                                              : static_cast<uint32_t>(value >> 32u);
+			break;
+		}
+		case ScalarValueOp::ShiftRightU64Low:
+		case ScalarValueOp::ShiftRightU64High: {
+			const auto value =
+			    (static_cast<uint64_t>(args[1]) << 32u | args[0]) >> (args[2] & 63u);
+			result = op == ScalarValueOp::ShiftRightU64Low ? static_cast<uint32_t>(value)
+			                                               : static_cast<uint32_t>(value >> 32u);
+			break;
+		}
 		case ScalarValueOp::Add3: result = args[0] + args[1] + args[2]; break;
 		case ScalarValueOp::ShiftLeftAdd: result = (args[0] << shift) + args[2]; break;
 		case ScalarValueOp::ShiftLeftAddCarry:

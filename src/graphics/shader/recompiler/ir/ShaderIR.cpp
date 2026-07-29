@@ -716,6 +716,26 @@ bool LowerVectorAddCarry(const Decoder::Instruction& decoded, BasicBlock& block,
 	return true;
 }
 
+bool LowerVectorSubBorrow(const Decoder::Instruction& decoded, BasicBlock& block,
+                          std::string* error) {
+	Instruction inst;
+	inst.pc          = decoded.pc;
+	inst.op          = Opcode::ISubBorrowU32;
+	inst.src_count   = 3;
+	const bool  rev  = decoded.opcode == Decoder::Opcode::VSubbrevU32;
+	const auto& src0 = rev ? decoded.src1 : decoded.src0;
+	const auto& src1 = rev ? decoded.src0 : decoded.src1;
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
+	    !LowerRegisterOperand(decoded.dst2, inst.dst2, error) ||
+	    !LowerSourceOperand(src0, inst.src[0], error) ||
+	    !LowerSourceOperand(src1, inst.src[1], error) ||
+	    !LowerSourceOperand(decoded.src2, inst.src[2], error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
 bool LowerVectorCarryOut(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
 	Instruction inst;
@@ -1081,6 +1101,8 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block
 		case Decoder::Opcode::VMovreldB32: return LowerVectorMoveRelDestination(inst, block, error);
 		case Decoder::Opcode::VMovrelsB32: return LowerVectorMoveRelSource(inst, block, error);
 		case Decoder::Opcode::VAddcU32: return LowerVectorAddCarry(inst, block, error);
+		case Decoder::Opcode::VSubbU32:
+		case Decoder::Opcode::VSubbrevU32: return LowerVectorSubBorrow(inst, block, error);
 		case Decoder::Opcode::VMadU64U32: return LowerVectorMadU64U32(inst, block, error);
 		case Decoder::Opcode::VMacF32: return LowerVectorMacF32(inst, block, error);
 		case Decoder::Opcode::VPkFmacF16: return LowerVectorPkFmacF16(inst, block, error);

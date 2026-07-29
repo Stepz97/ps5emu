@@ -1368,6 +1368,16 @@ struct DsCounterAddress {
 	uint32_t in_lds_bounds = 0;
 };
 
+// Ray-tracing placeholder: fill every result component of image_bvh_intersect_ray with the
+// miss sentinel 0xFFFFFFFF (invalid node pointer; NaN as intersection t), so guest traversal
+// loops pop their stack and finish with "no hit". See LowerImageBvhIntersectRayMiss.
+void EmitImageBvhIntersectRayMiss(EmitterState& state, const IR::Instruction& inst) {
+	const auto miss = ConstantU32(state, 0xffffffffu);
+	for (uint32_t i = 0; i < inst.memory.data_dwords; i++) {
+		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, i), miss);
+	}
+}
+
 DsCounterAddress EmitAppendConsumeAddress(EmitterState& state, const IR::Instruction& inst) {
 	const auto m0 = inst.src_count > 0 ? EmitValueLoad(state, inst.src[0]) : ConstantU32(state, 0);
 	const auto base      = state.builder.AllocateId();

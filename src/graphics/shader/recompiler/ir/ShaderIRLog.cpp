@@ -234,6 +234,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BitReverseU32: text += "BitReverseU32"; break;
 		case Opcode::BitCountU32: text += "BitCountU32"; break;
 		case Opcode::BitCountU64: text += "BitCountU64"; break;
+		case Opcode::FindLsbU64: text += "FindLsbU64"; break;
 		case Opcode::BitReplicateB64B32: text += "BitReplicateB64B32"; break;
 		case Opcode::BitCountAddU32: text += "BitCountAddU32"; break;
 		case Opcode::MaskedBitCountLowU32: text += "MaskedBitCountLowU32"; break;
@@ -280,6 +281,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::CompareLtU32: text += "CompareLtU32"; break;
 		case Opcode::CompareLeU32: text += "CompareLeU32"; break;
 		case Opcode::CompareNeU64: text += "CompareNeU64"; break;
+		case Opcode::CompareGtU64: text += "CompareGtU64"; break;
 		case Opcode::CompareMaskEqU32: text += "CompareMaskEqU32"; break;
 		case Opcode::CompareMaskNeU32: text += "CompareMaskNeU32"; break;
 		case Opcode::CompareMaskGtU32: text += "CompareMaskGtU32"; break;
@@ -488,6 +490,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DsWriteAddtidB32: text += "DsWriteAddtidB32"; break;
 		case Opcode::DsReadAddtidB32: text += "DsReadAddtidB32"; break;
 		case Opcode::ImageGetResinfo: text += "ImageGetResinfo"; break;
+		case Opcode::ImageBvhIntersectRay: text += "ImageBvhIntersectRay"; break;
 		case Opcode::ImageGetLod: text += "ImageGetLod"; break;
 		case Opcode::ImageLoad: text += "ImageLoad"; break;
 		case Opcode::ImageStore: text += "ImageStore"; break;

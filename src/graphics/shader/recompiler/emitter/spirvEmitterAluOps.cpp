@@ -68,6 +68,36 @@ void EmitFindLsbU32(EmitterState& state, const IR::Instruction& inst) {
 	EmitStoreU32(state, inst.dst, u32);
 }
 
+void EmitFindLsbU64(EmitterState& state, const IR::Instruction& inst) {
+	const auto low           = EmitSequentialValueLoad(state, inst.src[0], 0);
+	const auto high          = EmitSequentialValueLoad(state, inst.src[0], 1);
+	const auto low_i32       = state.builder.AllocateId();
+	const auto low_lsb       = state.builder.AllocateId();
+	const auto low_non_zero  = state.builder.AllocateId();
+	const auto high_i32      = state.builder.AllocateId();
+	const auto high_lsb      = state.builder.AllocateId();
+	const auto high_total    = state.builder.AllocateId();
+	const auto high_non_zero = state.builder.AllocateId();
+	const auto high_ret      = state.builder.AllocateId();
+	const auto ret           = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, state.int_type, low_i32, state.glsl_std450, GlslFindILsb, low});
+	state.builder.AddFunction({OpBitcast, state.uint_type, low_lsb, low_i32});
+	state.builder.AddFunction(
+	    {OpINotEqual, state.bool_type, low_non_zero, low, ConstantU32(state, 0)});
+	state.builder.AddFunction(
+	    {OpExtInst, state.int_type, high_i32, state.glsl_std450, GlslFindILsb, high});
+	state.builder.AddFunction({OpBitcast, state.uint_type, high_lsb, high_i32});
+	state.builder.AddFunction(
+	    {OpIAdd, state.uint_type, high_total, high_lsb, ConstantU32(state, 32)});
+	state.builder.AddFunction(
+	    {OpINotEqual, state.bool_type, high_non_zero, high, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpSelect, state.uint_type, high_ret, high_non_zero, high_total,
+	                           ConstantU32(state, 0xffffffffu)});
+	state.builder.AddFunction({OpSelect, state.uint_type, ret, low_non_zero, low_lsb, high_ret});
+	EmitStoreU32(state, inst.dst, ret);
+}
+
 void EmitFindMsbFromHighU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto src      = EmitValueLoad(state, inst.src[0]);
 	const auto i32      = state.builder.AllocateId();
@@ -580,14 +610,34 @@ void EmitIAddCarryU32(EmitterState& state, const IR::Instruction& inst) {
 }
 
 void EmitISubBorrowU32(EmitterState& state, const IR::Instruction& inst) {
-	const auto lhs    = EmitValueLoad(state, inst.src[0]);
-	const auto rhs    = EmitValueLoad(state, inst.src[1]);
-	const auto result = state.builder.AllocateId();
-	const auto borrow = state.builder.AllocateId();
-	state.builder.AddFunction({OpISub, state.uint_type, result, lhs, rhs});
-	state.builder.AddFunction({OpUGreaterThan, state.bool_type, borrow, rhs, lhs});
+	const auto lhs = EmitValueLoad(state, inst.src[0]);
+	const auto rhs = EmitValueLoad(state, inst.src[1]);
+	if (inst.src_count < 3) {
+		// v_sub_i32 / v_subrev_i32: borrow-out only.
+		const auto result = state.builder.AllocateId();
+		const auto borrow = state.builder.AllocateId();
+		state.builder.AddFunction({OpISub, state.uint_type, result, lhs, rhs});
+		state.builder.AddFunction({OpUGreaterThan, state.bool_type, borrow, rhs, lhs});
+		EmitStoreU32(state, inst.dst, result);
+		EmitLaneMaskPairFromBool(state, inst.dst2, borrow);
+		return;
+	}
+	// v_subb(rev)_u32: src[2] is the per-lane borrow-in mask;
+	// dst = lhs - rhs - borrow_in, borrow-out when either subtraction wraps.
+	const auto borrow_in_active = EmitLaneMaskOperandActiveBool(state, inst.src[2]);
+	const auto borrow_in        = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, state.uint_type, borrow_in, borrow_in_active,
+	                           ConstantU32(state, 1), ConstantU32(state, 0)});
+	const auto partial = state.builder.AllocateId();
+	const auto result  = state.builder.AllocateId();
+	const auto borrow0 = state.builder.AllocateId();
+	const auto borrow1 = state.builder.AllocateId();
+	state.builder.AddFunction({OpISub, state.uint_type, partial, lhs, rhs});
+	state.builder.AddFunction({OpUGreaterThan, state.bool_type, borrow0, rhs, lhs});
+	state.builder.AddFunction({OpISub, state.uint_type, result, partial, borrow_in});
+	state.builder.AddFunction({OpUGreaterThan, state.bool_type, borrow1, borrow_in, partial});
 	EmitStoreU32(state, inst.dst, result);
-	EmitLaneMaskPairFromBool(state, inst.dst2, borrow);
+	EmitLaneMaskPairFromBool(state, inst.dst2, EmitLogicalOrBool(state, borrow0, borrow1));
 }
 
 void EmitScalarAddCarryU32(EmitterState& state, const IR::Instruction& inst) {
@@ -1497,6 +1547,24 @@ void EmitCompareNeU64(EmitterState& state, const IR::Instruction& inst) {
 	state.builder.AddFunction({OpINotEqual, state.bool_type, ne_low, lhs_low, rhs_low});
 	state.builder.AddFunction({OpINotEqual, state.bool_type, ne_high, lhs_high, rhs_high});
 	state.builder.AddFunction({OpLogicalOr, state.bool_type, cond, ne_low, ne_high});
+	EmitCompareResult(state, inst.dst, cond);
+}
+
+void EmitCompareGtU64(EmitterState& state, const IR::Instruction& inst) {
+	const auto lhs_low  = EmitSequentialValueLoad(state, inst.src[0], 0);
+	const auto lhs_high = EmitSequentialValueLoad(state, inst.src[0], 1);
+	const auto rhs_low  = EmitSequentialValueLoad(state, inst.src[1], 0);
+	const auto rhs_high = EmitSequentialValueLoad(state, inst.src[1], 1);
+	const auto gt_high  = state.builder.AllocateId();
+	const auto eq_high  = state.builder.AllocateId();
+	const auto gt_low   = state.builder.AllocateId();
+	const auto low_path = state.builder.AllocateId();
+	const auto cond     = state.builder.AllocateId();
+	state.builder.AddFunction({OpUGreaterThan, state.bool_type, gt_high, lhs_high, rhs_high});
+	state.builder.AddFunction({OpIEqual, state.bool_type, eq_high, lhs_high, rhs_high});
+	state.builder.AddFunction({OpUGreaterThan, state.bool_type, gt_low, lhs_low, rhs_low});
+	state.builder.AddFunction({OpLogicalAnd, state.bool_type, low_path, eq_high, gt_low});
+	state.builder.AddFunction({OpLogicalOr, state.bool_type, cond, gt_high, low_path});
 	EmitCompareResult(state, inst.dst, cond);
 }
 

@@ -27,6 +27,10 @@ uint32_t ScalarValueArgCount(ScalarValueOp op) {
 		case ScalarValueOp::BitFieldMaskU32:
 		case ScalarValueOp::BitFieldMaskU64Low:
 		case ScalarValueOp::BitFieldMaskU64High: return 2;
+		case ScalarValueOp::ShiftLeftU64Low:
+		case ScalarValueOp::ShiftLeftU64High:
+		case ScalarValueOp::ShiftRightU64Low:
+		case ScalarValueOp::ShiftRightU64High: return 3;
 		case ScalarValueOp::AddCarry:
 		case ScalarValueOp::Carry:
 		case ScalarValueOp::SubBorrow:
@@ -649,6 +653,31 @@ private:
 					state.regs[dst + 1] = Define(inst, ScalarValueOp::BitFieldMaskU64High, before);
 				}
 				break;
+			case Opcode::ShiftLeftLogicalU64:
+			case Opcode::ShiftRightLogicalU64: {
+				// The high dword of the source pair is implicit (src + 1), so the generic
+				// Define() cannot capture it; build the nodes by hand with
+				// args = [src_low, src_high, amount]. Real titles shift a 64-bit pointer to
+				// derive descriptor addresses (s_lshl_b64 sdst, saddr, 3).
+				uint32_t src = 0;
+				if (inst.src_count >= 2 && dst + 1 < ScalarRegisters &&
+				    ScalarRegister(inst.src[0], src) && src + 1 < ScalarRegisters) {
+					const bool  left = inst.op == Opcode::ShiftLeftLogicalU64;
+					ScalarValue low_node;
+					low_node.op = left ? ScalarValueOp::ShiftLeftU64Low
+					                   : ScalarValueOp::ShiftRightU64Low;
+					low_node.pc      = inst.pc;
+					low_node.args[0] = before.regs[src];
+					low_node.args[1] = before.regs[src + 1];
+					low_node.args[2] = OperandValue(inst.src[1], before);
+					auto high_node   = low_node;
+					high_node.op     = left ? ScalarValueOp::ShiftLeftU64High
+					                        : ScalarValueOp::ShiftRightU64High;
+					value               = InternValue(std::move(low_node));
+					state.regs[dst + 1] = InternValue(std::move(high_node));
+				}
+				break;
+			}
 			case Opcode::SLoadDword: value = ReadConst(inst, before, false); break;
 			case Opcode::SBufferLoadDword: value = ReadConst(inst, before, true); break;
 			case Opcode::ReadLaneU32: value = ReadVectorLane(inst, before); break;
