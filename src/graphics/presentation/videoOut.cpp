@@ -101,6 +101,17 @@ struct VideoOutBufferAttribute2 {
 	uint64_t reserved1[3];
 };
 
+// PS4 layout (OrbisVideoOutBufferAttribute)
+struct VideoOutBufferAttribute {
+	int32_t  format;
+	int32_t  tiling_mode;
+	int32_t  aspect_ratio;
+	uint32_t width;
+	uint32_t height;
+	uint32_t pitch_in_pixel;
+	uint64_t reserved[2];
+};
+
 // PS5 layout
 struct VideoOutFlipStatus {
 	uint64_t count                    = 0;
@@ -1211,6 +1222,34 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
 	attribute->dcc_control                 = dcc_control;
 }
 
+KYTY_SYSV_ABI void VideoOutSetBufferAttribute(VideoOutBufferAttribute* attribute,
+                                              uint32_t pixel_format, uint32_t tiling_mode,
+                                              uint32_t aspect_ratio, uint32_t width, uint32_t height,
+                                              uint32_t pitch_in_pixel) {
+	PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(attribute == nullptr);
+
+	LOGF("\t pixel_format   = %08" PRIx32 "\n"
+	     "\t tiling_mode    = %" PRIu32 "\n"
+	     "\t aspect_ratio   = %" PRIu32 "\n"
+	     "\t width          = %" PRIu32 "\n"
+	     "\t height         = %" PRIu32 "\n"
+	     "\t pitch_in_pixel = %" PRIu32 "\n",
+	     pixel_format, tiling_mode, aspect_ratio, width, height, pitch_in_pixel);
+
+	// Just a struct-fill helper, same as on real HW: the actual translation into the
+	// internal (PS5) attribute happens later, in VideoOutRegisterBuffers.
+	memset(attribute, 0, sizeof(VideoOutBufferAttribute));
+
+	attribute->format         = static_cast<int32_t>(pixel_format);
+	attribute->tiling_mode    = static_cast<int32_t>(tiling_mode);
+	attribute->aspect_ratio   = static_cast<int32_t>(aspect_ratio);
+	attribute->width          = width;
+	attribute->height         = height;
+	attribute->pitch_in_pixel = pitch_in_pixel;
+}
+
 KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
 
@@ -1365,6 +1404,63 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	}
 
 	return OK;
+}
+
+// Expands a PS4 (v1) 32-bit pixel-format code into the wider 64-bit encoding used by
+// VideoOutBufferAttribute2 / DecodeVideoOutPixelFormat: each 8-bit sub-field becomes the
+// high byte of a 16-bit sub-field (e.g. legacy 0x80002200 -> 0x8000000022000000).
+static uint64_t ExpandLegacyPixelFormat(uint32_t format) {
+	uint64_t expanded = 0;
+	for (int byte_index = 0; byte_index < 4; byte_index++) {
+		const auto byte = static_cast<uint64_t>((format >> (24 - byte_index * 8)) & 0xFF);
+		expanded |= byte << (56 - byte_index * 16);
+	}
+	return expanded;
+}
+
+KYTY_SYSV_ABI int VideoOutRegisterBuffers(int handle, int buffer_index_start,
+                                          void* const* addresses, int buffer_num,
+                                          const VideoOutBufferAttribute* attribute) {
+	PRINT_NAME();
+
+	if (addresses == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+	if (attribute == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_OPTION;
+	}
+	if (buffer_num < 1 || buffer_num > VIDEO_OUT_BUFFER_NUM_MAX) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+
+	LOGF("\t buffer_index_start = %d\n"
+	     "\t buffer_num         = %d\n"
+	     "\t format             = %08" PRIx32 "\n"
+	     "\t tiling_mode        = %" PRId32 "\n"
+	     "\t aspect_ratio       = %" PRId32 "\n"
+	     "\t width              = %" PRIu32 "\n"
+	     "\t height             = %" PRIu32 "\n"
+	     "\t pitch_in_pixel     = %" PRIu32 "\n",
+	     buffer_index_start, buffer_num, static_cast<uint32_t>(attribute->format),
+	     attribute->tiling_mode, attribute->aspect_ratio, attribute->width, attribute->height,
+	     attribute->pitch_in_pixel);
+
+	// tiling_mode/pitch_in_pixel are not forwarded: VideoOutSetBufferAttribute2 forces the
+	// internal attribute's equivalent fields to 0, which is a hard requirement further down
+	// (ImageInfo() rejects anything else) — video-out buffers always use a single, fixed
+	// internal tiling regardless of what the PS4 title requested.
+	VideoOutBufferAttribute2 attribute2 {};
+	VideoOutSetBufferAttribute2(&attribute2, ExpandLegacyPixelFormat(static_cast<uint32_t>(attribute->format)),
+	                            0, attribute->width, attribute->height, 0, 0, 0);
+
+	std::vector<VideoOutBuffers> buffers(static_cast<size_t>(buffer_num));
+	for (int i = 0; i < buffer_num; i++) {
+		buffers[static_cast<size_t>(i)] = VideoOutBuffers {.data = addresses[i], .metadata = nullptr};
+	}
+
+	return VideoOutRegisterBuffers2(handle, /*set_index*/ 0, buffer_index_start, buffers.data(),
+	                                buffer_num, &attribute2,
+	                                VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED, nullptr);
 }
 
 KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index,
