@@ -4300,6 +4300,34 @@ void GraphicsInitJmpTablesShIndirect() {
 		cp.GetShCtx().SetEsShaderBase(base);
 	};
 
+	// The ES stage RSRC registers share the VS field layout (same reuse as LS/HS above).
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HW::VsShaderResource1 r1;
+		r1.vgprs                = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, VGPRS);
+		r1.sgprs                = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, SGPRS);
+		r1.priority             = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, PRIORITY);
+		r1.float_mode           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FLOAT_MODE);
+		r1.dx10_clamp           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, DX10_CLAMP) != 0;
+		r1.ieee_mode            = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, IEEE_MODE) != 0;
+		r1.vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, VGPR_COMP_CNT);
+		r1.cu_group_enable = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, CU_GROUP_ENABLE) != 0;
+		r1.require_forward_progress =
+		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FWD_PROGRESS) != 0;
+		r1.fp16_overflow = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FP16_OVFL) != 0;
+		cp.GetShCtx().SetEsShaderResource1(r1);
+	};
+
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC2_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HW::VsShaderResource2 r2;
+		r2.scratch_en        = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SCRATCH_EN) != 0;
+		r2.user_sgpr         = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR) +
+		                       (KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR_MSB) << 5u);
+		r2.offchip_lds       = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, OC_LDS_EN) != 0;
+		r2.streamout_enabled = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SO_EN) != 0;
+		r2.shared_vgprs      = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SHARED_VGPR_CNT);
+		cp.GetShCtx().SetEsShaderResource2(r2);
+	};
+
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		auto base = cp.GetShCtx().GetVs().gs_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
