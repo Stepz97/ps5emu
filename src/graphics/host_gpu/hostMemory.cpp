@@ -12,6 +12,11 @@
 #undef max
 #endif
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+
 namespace Libs::Graphics {
 namespace {
 
@@ -52,6 +57,37 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 		}
 		if (finish <= current || (region.State & MEM_COMMIT) == 0 ||
 		    !IsAccessible(region.Protect, access)) {
+			break;
+		}
+		current = finish < end ? finish : end;
+	}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX && defined(__APPLE__)
+	// Darwin has no /proc/self/maps; walk the Mach VM map instead. Tracker-protected pages
+	// (VM_PROT_NONE) still count as Mapped so reads through them can fault-and-sync.
+	while (current < end) {
+		mach_vm_address_t              region_addr = current;
+		mach_vm_size_t                 region_size = 0;
+		vm_region_basic_info_data_64_t info {};
+		mach_msg_type_number_t         info_count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t                    object     = MACH_PORT_NULL;
+		if (mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+		                   reinterpret_cast<vm_region_info_t>(&info), &info_count,
+		                   &object) != KERN_SUCCESS) {
+			break;
+		}
+		if (object != MACH_PORT_NULL) {
+			mach_port_deallocate(mach_task_self(), object);
+		}
+		if (region_addr > current) {
+			break;
+		}
+		const bool allowed =
+		    access == HostMemoryAccess::Mapped || (info.protection & VM_PROT_READ) != 0;
+		if (!allowed) {
+			break;
+		}
+		const auto finish = region_addr + region_size;
+		if (finish <= current) {
 			break;
 		}
 		current = finish < end ? finish : end;
