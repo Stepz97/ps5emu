@@ -595,12 +595,8 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 		return;
 	}
 
-	static bool dumped = false;
-	if (dumped) {
-		return;
-	}
-	dumped = true;
-
+	// Overwrite on every flip so the file always holds the latest presented frame (the
+	// first frame of a real title is usually a black fade-in).
 	if (info.data.address == 0 || info.extent.width == 0 || info.extent.height == 0 ||
 	    info.bytes_per_block < 3) {
 		return;
@@ -611,9 +607,14 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 	const auto  height      = info.extent.height;
 	const auto  pitch_bytes = static_cast<uint64_t>(info.pitch) * info.bytes_per_block;
 
-	FILE* file = fopen(path.c_str(), "wb");
+	// Write to a temp file and rename over the target so a crash mid-dump (the very
+	// scenario the per-flip overwrite exists to capture) never truncates the last
+	// complete frame.
+	auto temp_path = path;
+	temp_path += ".tmp";
+	FILE* file = fopen(temp_path.c_str(), "wb");
 	if (file == nullptr) {
-		LOGF("failed to open %s for scan-out dump\n", path.c_str());
+		LOGF("failed to open %s for scan-out dump\n", temp_path.c_str());
 		return;
 	}
 
@@ -629,6 +630,10 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 	}
 
 	fclose(file);
+	if (std::rename(temp_path.c_str(), path.c_str()) != 0) {
+		LOGF("failed to move scan-out dump into place: %s\n", path.c_str());
+		return;
+	}
 
 	LOGF("dumped scan-out frame to %s (%ux%u pitch=%" PRIu64 ")\n", path.c_str(), width, height,
 	     pitch_bytes);
