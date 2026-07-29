@@ -4,7 +4,10 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
-#elif !defined(__APPLE__)
+#elif defined(__APPLE__)
+#include <sched.h>
+#include <sys/ucontext.h>
+#else
 #include <sched.h>
 #include <ucontext.h>
 #endif
@@ -253,18 +256,152 @@ static bool TryEmulateMonitorxMwaitx(ucontext_t* context) {
 	return true;
 }
 
+#else
+
+// Darwin exposes the x86-64 state through pointers in the ucontext: __ss (thread state) and
+// __fs (float state), where the 16 xmm registers are consecutive 16-byte _STRUCT_XMM_REG
+// fields. Under Rosetta 2 the emulated x86-64 context is materialized here as well, and edits
+// to __ss.__rip / __fs are honored on sigreturn (validated experimentally: a SIGILL handler
+// emulating EXTRQ this way produces the correct xmm result and resumes past the instruction).
+
+static uint32_t* GetContextXmm(ucontext_t* context, uint8_t index) {
+	if (context == nullptr || context->uc_mcontext == nullptr || index >= 16) {
+		return nullptr;
+	}
+
+	auto* base = reinterpret_cast<uint8_t*>(&context->uc_mcontext->__fs.__fpu_xmm0);
+	return reinterpret_cast<uint32_t*>(base + static_cast<size_t>(index) * 16u);
+}
+
+static uint64_t GetXmmLow(const uint32_t* xmm) {
+	return static_cast<uint64_t>(xmm[0]) | (static_cast<uint64_t>(xmm[1]) << 32u);
+}
+
+static uint64_t GetXmmHigh(const uint32_t* xmm) {
+	return static_cast<uint64_t>(xmm[2]) | (static_cast<uint64_t>(xmm[3]) << 32u);
+}
+
+static void SetXmmLow(uint32_t* xmm, uint64_t value) {
+	xmm[0] = static_cast<uint32_t>(value);
+	xmm[1] = static_cast<uint32_t>(value >> 32u);
+}
+
+static void SetXmmHigh(uint32_t* xmm, uint64_t value) {
+	xmm[2] = static_cast<uint32_t>(value);
+	xmm[3] = static_cast<uint32_t>(value >> 32u);
+}
+
+// AMD SSE4a EXTRQ/INSERTQ. PS5 code runs these natively on its Zen 2 cpu; Rosetta 2 emulates
+// an Intel cpu and raises an illegal-instruction fault. Unlike the other platforms, the
+// register forms (66/F2 0F 79) are handled too: real PS5 titles use them (Astro Bot's eboot
+// has 27 register-form EXTRQ sites vs 1 immediate-form).
+static bool TryEmulateSse4a(ucontext_t* context) {
+	if (context == nullptr || context->uc_mcontext == nullptr) {
+		return false;
+	}
+
+	auto&       ss  = context->uc_mcontext->__ss;
+	const auto* rip = reinterpret_cast<const uint8_t*>(ss.__rip);
+
+	const uint8_t prefix = rip[0];
+	if (prefix != 0x66 && prefix != 0xf2) {
+		return false;
+	}
+
+	size_t  offset = 1;
+	uint8_t rex    = 0;
+	if ((rip[offset] & 0xf0u) == 0x40u) {
+		rex = rip[offset];
+		offset++;
+	}
+
+	if (rip[offset] != 0x0f || (rip[offset + 1] != 0x78 && rip[offset + 1] != 0x79)) {
+		return false;
+	}
+	const bool imm_form = (rip[offset + 1] == 0x78);
+
+	auto modrm = rip[offset + 2];
+	if ((modrm & 0xc0u) != 0xc0u) {
+		return false;
+	}
+
+	const uint8_t reg = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
+	const uint8_t rm  = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
+
+	if (imm_form) {
+		const uint8_t length = rip[offset + 3];
+		const uint8_t index  = rip[offset + 4];
+
+		if (prefix == 0x66) {
+			// EXTRQ xmm(rm), length, index (66 0F 78 /0 ib ib).
+			auto* dst = GetContextXmm(context, rm);
+			if (dst == nullptr) {
+				return false;
+			}
+			SetXmmLow(dst, ExtractBitField(GetXmmLow(dst), length, index));
+			SetXmmHigh(dst, 0);
+		} else {
+			// INSERTQ xmm(reg), xmm(rm), length, index (F2 0F 78 /r ib ib).
+			auto* dst = GetContextXmm(context, reg);
+			auto* src = GetContextXmm(context, rm);
+			if (dst == nullptr || src == nullptr) {
+				return false;
+			}
+			SetXmmLow(dst, InsertBitField(GetXmmLow(dst), GetXmmLow(src), length, index));
+		}
+		ss.__rip += offset + 5;
+		return true;
+	}
+
+	// Register forms: length in bits [5:0] and index in bits [13:8] of the source register's
+	// low qword for EXTRQ (66 0F 79 /r), of its high qword for INSERTQ (F2 0F 79 /r).
+	auto* dst = GetContextXmm(context, reg);
+	auto* src = GetContextXmm(context, rm);
+	if (dst == nullptr || src == nullptr) {
+		return false;
+	}
+
+	if (prefix == 0x66) {
+		const auto sel = GetXmmLow(src);
+		SetXmmLow(dst, ExtractBitField(GetXmmLow(dst), sel & 0x3fu, (sel >> 8u) & 0x3fu));
+		SetXmmHigh(dst, 0);
+	} else {
+		const auto sel = GetXmmHigh(src);
+		SetXmmLow(dst,
+		          InsertBitField(GetXmmLow(dst), GetXmmLow(src), sel & 0x3fu, (sel >> 8u) & 0x3fu));
+	}
+	ss.__rip += offset + 3;
+	return true;
+}
+
+static bool TryEmulateMonitorxMwaitx(ucontext_t* context) {
+	if (context == nullptr || context->uc_mcontext == nullptr) {
+		return false;
+	}
+
+	auto&       ss  = context->uc_mcontext->__ss;
+	const auto* rip = reinterpret_cast<const uint8_t*>(ss.__rip);
+	if (rip[0] != 0x0f || rip[1] != 0x01 || (rip[2] != 0xfa && rip[2] != 0xfb)) {
+		return false;
+	}
+
+	// Approximate AMD MONITORX/MWAITX as no-op/yield.
+	if (rip[2] == 0xfb) {
+		::sched_yield();
+	}
+	ss.__rip += 3;
+	return true;
+}
+
 #endif
 
 bool TryEmulate(void* native_context) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	auto* context = static_cast<PCONTEXT>(native_context);
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context);
-#elif !defined(__APPLE__)
+#else
 	auto* context = static_cast<ucontext_t*>(native_context);
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context);
-#else
-	(void)native_context;
-	return false;
 #endif
 }
 
