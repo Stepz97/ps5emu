@@ -1049,7 +1049,10 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 			if ((!page.resolving_read_write && access != PageFaultAccess::Write) ||
 			    (page.resolving_read_write && access != PageFaultAccess::Read &&
 			     access != PageFaultAccess::Write)) {
-				FailFast("fault access is incompatible with the active resolver");
+				Fatal("fault access %u at 0x%016" PRIx64
+				      " is incompatible with the active resolver (read_write=%u)",
+				      static_cast<uint32_t>(access), fault_vaddr,
+				      page.resolving_read_write ? 1u : 0u);
 			}
 			waited = true;
 			continue;
@@ -1073,7 +1076,20 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 		}
 		if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||
 		    (access == PageFaultAccess::Read && page.access_watchers == 0)) {
-			FailFast("fault access is incompatible with active page watchers");
+			// Same multi-CPU window as the delayed-fault path below, but with a write
+			// watcher remaining: a read fault raised while an access watcher still
+			// protected the page can arrive after another thread resolved it and
+			// consumed the delayed-fault hint. Resume once the mapping permits the read.
+			if (access == PageFaultAccess::Read &&
+			    Impl::AllowsAccess(page, fault_vaddr, access)) {
+				return true;
+			}
+			Fatal("fault access %u at 0x%016" PRIx64
+			      " is incompatible with active page watchers (write_watchers=%u "
+			      "access_watchers=%u original_protection=0x%02x)",
+			      static_cast<uint32_t>(access), fault_vaddr,
+			      static_cast<uint32_t>(page.write_watchers),
+			      static_cast<uint32_t>(page.access_watchers), page.original_protection);
 		}
 		page.resolving            = true;
 		page.resolving_read_write = page.access_watchers != 0;
