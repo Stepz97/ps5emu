@@ -363,6 +363,65 @@ uint32_t EmitFlatVirtualAddress(EmitterState& state, const IR::Instruction& inst
 	return EmitSelectU32Value(state, valid, relative_low, ConstantU32(state, UINT32_MAX));
 }
 
+// Address path for scalar loads degraded by resource tracking: provenance could not fold the
+// descriptor chain, but the live SGPR pair at dynamic_base_reg holds the exact guest pointer
+// (or V# base qword) this load uses. Recompute the full 64-bit address from those registers
+// and translate it against the per-resource window base chosen at materialization time.
+uint32_t EmitDynamicScalarAddress(EmitterState& state, const IR::Instruction& inst) {
+	if (inst.memory.resource >= state.resources.addresses.size() || inst.src_count != 1) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
+		                             inst.memory.resource, "dynamic address snapshot is missing");
+	}
+	// Scalar loads are dword aligned; a V# base qword keeps only 16 address bits high.
+	auto low = EmitBinaryU32(
+	    state, OpBitwiseAnd,
+	    EmitRegisterLoad(state, {IR::RegisterFile::Scalar, inst.memory.dynamic_base_reg}),
+	    ConstantU32(state, ~3u));
+	auto high =
+	    EmitRegisterLoad(state, {IR::RegisterFile::Scalar, inst.memory.dynamic_base_reg + 1u});
+	if (inst.memory.dynamic_base_vsharp) {
+		high = EmitBinaryU32(state, OpBitwiseAnd, high, ConstantU32(state, 0xffffu));
+	}
+
+	const auto add_with_carry = [&](uint32_t value, uint32_t value_high) {
+		const auto next       = EmitAddU32(state, low, value);
+		const auto carry_bool = state.builder.AllocateId();
+		state.builder.AddFunction({OpULessThan, state.bool_type, carry_bool, next, low});
+		if (value_high != 0) {
+			high = EmitAddU32(state, high, ConstantU32(state, value_high));
+		}
+		high = EmitAddU32(state, high,
+		                  EmitSelectU32Value(state, carry_bool, ConstantU32(state, 1),
+		                                     ConstantU32(state, 0)));
+		low  = next;
+	};
+	// The SGPR offset operand is unsigned; the SMEM immediate is sign-extended, so its high
+	// word participates in the sum (same treatment as EmitFlatVirtualAddress).
+	add_with_carry(EmitBinaryU32(state, OpBitwiseAnd, EmitValueLoad(state, inst.src[0]),
+	                             ConstantU32(state, ~3u)),
+	               0);
+	if ((inst.memory.offset & ~3u) != 0) {
+		add_with_carry(ConstantU32(state, inst.memory.offset & ~3u),
+		               (inst.memory.offset & 0x80000000u) != 0 ? UINT32_MAX : 0u);
+	}
+
+	const auto base         = state.program.info.addresses[inst.memory.resource].specialized_base;
+	const auto base_low     = static_cast<uint32_t>(base);
+	const auto base_high    = static_cast<uint32_t>(base >> 32u);
+	const auto relative_low = EmitBinaryU32(state, OpISub, low, ConstantU32(state, base_low));
+	const auto borrow_bool  = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpULessThan, state.bool_type, borrow_bool, low, ConstantU32(state, base_low)});
+	const auto borrow =
+	    EmitSelectU32Value(state, borrow_bool, ConstantU32(state, 1), ConstantU32(state, 0));
+	const auto relative_high = EmitBinaryU32(
+	    state, OpISub, EmitBinaryU32(state, OpISub, high, ConstantU32(state, base_high)), borrow);
+	const auto valid = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpIEqual, state.bool_type, valid, relative_high, ConstantU32(state, 0)});
+	return EmitSelectU32Value(state, valid, relative_low, ConstantU32(state, UINT32_MAX));
+}
+
 uint32_t EmitMemoryByteAddress(EmitterState& state, const IR::Instruction& inst,
                                const IR::MemoryInfo& mem, uint32_t first_src, uint32_t src_count) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
@@ -1193,7 +1252,9 @@ void EmitSLoadDword(EmitterState& state, const IR::Instruction& inst) {
 	}
 	const auto binding = ResourceForDescriptor(state, IR::DescriptorBindingKind::AddressMemory,
 	                                           inst.memory.resource);
-	const auto address = EmitRelativeAddress(state, inst, 0, 1, false, true);
+	const auto address = inst.memory.dynamic_base
+	                         ? EmitDynamicScalarAddress(state, inst)
+	                         : EmitRelativeAddress(state, inst, 0, 1, false, true);
 	const auto index   = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpShiftRightLogical, state.uint_type, index, address, ConstantU32(state, 2)});

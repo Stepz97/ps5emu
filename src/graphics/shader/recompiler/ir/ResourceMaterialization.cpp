@@ -71,7 +71,8 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 
 uint64_t AddressSpecialization(const AddressResource&           resource,
                                const ResourceSnapshot::Address& snapshot) {
-	return resource.kind == ResourceKind::Flat || resource.source == ScalarProvenance::Unknown
+	return resource.kind == ResourceKind::Flat ||
+	               resource.source == ScalarProvenance::Unknown || resource.dynamic_base
 	           ? snapshot.binding_base
 	           : snapshot.guest_base - snapshot.binding_base;
 }
@@ -257,7 +258,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		requests.push_back({sampler.source, sampler.first_use_pc});
 	}
 	for (const auto& address: program.info.addresses) {
-		if (address.source != ScalarProvenance::Unknown) {
+		if (address.source != ScalarProvenance::Unknown && !address.dynamic_base) {
 			requests.push_back({address.source, address.first_use_pc});
 		}
 	}
@@ -288,6 +289,20 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
 	cursor += program.info.samplers.size();
 	for (const auto& address: program.info.addresses) {
+		if (address.dynamic_base) {
+			DescriptorValue value;
+			uint64_t        anchor = 0;
+			if (EvaluateDescriptorSourceApprox(program, address.source, runtime, value)) {
+				const auto high = value.dword_count == 4 ? value.dwords[1] & 0xffffu
+				                                         : value.dwords[1];
+				anchor = (static_cast<uint64_t>(value.dwords[0]) |
+				          static_cast<uint64_t>(high) << 32u) &
+				         AddressMask & ~uint64_t {3};
+			}
+			const auto binding_base = anchor & ~(DynamicAddressWindowAlign - 1u);
+			next.addresses.push_back({anchor, binding_base});
+			continue;
+		}
 		if (address.source != ScalarProvenance::Unknown) {
 			const auto value = *cursor++;
 			auto       base  = (static_cast<uint64_t>(value.dwords[0]) |

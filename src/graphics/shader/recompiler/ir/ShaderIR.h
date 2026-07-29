@@ -431,6 +431,12 @@ struct MemoryInfo {
 	// exact scalar definitions reaching this instruction before that patching step.
 	uint32_t resource_source = 0;
 	uint32_t sampler_source  = 0;
+	// Scalar loads whose descriptor chain cannot be resolved statically degrade to computing
+	// the guest address from the live SGPRs at dynamic_base_reg (a pointer pair, or a V# base
+	// qword when dynamic_base_vsharp masks the high half to its 16 address bits).
+	uint32_t dynamic_base_reg    = 0;
+	bool     dynamic_base        = false;
+	bool     dynamic_base_vsharp = false;
 	bool     data_signed     = false;
 	bool     typed           = false;
 	bool     formatted       = false;
@@ -642,6 +648,9 @@ struct AddressResource {
 	bool         read             = false;
 	bool         written          = false;
 	bool         atomic           = false;
+	// The binding window base is an approximate per-dispatch anchor instead of an exactly
+	// evaluated descriptor; the shader translates its own full 64-bit address against it.
+	bool         dynamic_base     = false;
 
 	bool operator==(const AddressResource& other) const = default;
 };

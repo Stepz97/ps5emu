@@ -1051,6 +1051,40 @@ bool DescriptorSourceResolved(const Program& program, uint32_t source) {
 	return true;
 }
 
+namespace {
+
+bool ChainContainsUnknown(const ScalarProvenance& provenance, uint32_t id,
+                          std::vector<uint8_t>& state) {
+	if (id <= ScalarProvenance::Unknown || id >= provenance.values.size()) {
+		return id == ScalarProvenance::Unknown;
+	}
+	// 1 = in progress (a cycle alone is not an Unknown), 2 = clean, 3 = contains Unknown.
+	if (state[id] != 0) {
+		return state[id] == 3;
+	}
+	state[id]         = 1;
+	const auto& value = provenance.values[id];
+	bool        found = false;
+	if (value.op == ScalarValueOp::Phi) {
+		for (const auto arg: value.phi_args) {
+			found = found || ChainContainsUnknown(provenance, arg, state);
+		}
+	} else {
+		for (uint32_t i = 0; i < ScalarValueArgCount(value.op); i++) {
+			found = found || ChainContainsUnknown(provenance, value.args[i], state);
+		}
+	}
+	state[id] = found ? 3 : 2;
+	return found;
+}
+
+} // namespace
+
+bool ScalarChainContainsUnknown(const ScalarProvenance& provenance, uint32_t id) {
+	std::vector<uint8_t> state(provenance.values.size());
+	return ChainContainsUnknown(provenance, id, state);
+}
+
 std::string ScalarValueToString(const ScalarProvenance& provenance, uint32_t value) {
 	if (value >= provenance.values.size()) {
 		return "invalid";

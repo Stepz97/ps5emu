@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <fmt/format.h>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -328,9 +329,20 @@ private:
 			}
 		}
 		if (value.op == ScalarValueOp::ReadConst || value.op == ScalarValueOp::ReadConstBuffer) {
+			// The offset argument sits right after the base arguments, so its index doubles
+			// as the base-argument count below.
 			const auto offset_arg = value.op == ScalarValueOp::ReadConst ? 2u : 4u;
-			uint32_t   ignored    = 0;
-			if (m_folder.Fold(value.args[offset_arg], ignored)) {
+			// A read whose base chain contains an Unknown can never be evaluated by the
+			// per-dispatch walk, so it must stay an explicit in-shader load instead of
+			// receiving a flat SRT slot.
+			bool evaluable_base = true;
+			for (uint32_t i = 0; i < offset_arg; i++) {
+				evaluable_base =
+				    evaluable_base &&
+				    !ScalarChainContainsUnknown(m_program.provenance, value.args[i]);
+			}
+			uint32_t ignored = 0;
+			if (evaluable_base && m_folder.Fold(value.args[offset_arg], ignored)) {
 				m_program.srt.reads.push_back(
 				    {id, static_cast<uint32_t>(m_program.srt.reads.size()), use_pc});
 			} else {
@@ -517,6 +529,115 @@ private:
 	std::vector<uint8_t>  m_state;
 };
 
+// Best-effort evaluation used to anchor the binding window of dynamic-base address resources.
+// Never fails: Unknown leaves, cycles, unreadable memory and failed operations yield "no
+// information" (nullopt), phis take the piecewise minimum over informative branches, and
+// uninformative operands participate as zero. The result is an anchor heuristic, not a proof.
+class ApproximateEvaluator {
+public:
+	ApproximateEvaluator(const Program& program, const SrtRuntime& runtime)
+	    : m_program(program), m_runtime(runtime), m_values(program.provenance.values.size()),
+	      m_state(program.provenance.values.size()) {}
+
+	std::optional<uint32_t> Evaluate(uint32_t id) {
+		if (id >= m_program.provenance.values.size()) {
+			return std::nullopt;
+		}
+		if (m_state[id] == 2) {
+			return m_values[id];
+		}
+		if (m_state[id] == 1 || m_state[id] == 3) {
+			// In-progress cycles carry no information; memoized failures stay failures.
+			return std::nullopt;
+		}
+		m_state[id]               = 1;
+		const auto& value         = m_program.provenance.values[id];
+		std::optional<uint32_t> out;
+		switch (value.op) {
+			case ScalarValueOp::UserData:
+				if (value.imm >= m_program.user_data_base &&
+				    value.imm - m_program.user_data_base < m_runtime.user_data.size()) {
+					out = m_runtime.user_data[value.imm - m_program.user_data_base];
+				}
+				break;
+			case ScalarValueOp::Constant: out = value.imm; break;
+			case ScalarValueOp::PcRelativeLow:
+				out = static_cast<uint32_t>(m_runtime.shader_base + value.imm);
+				break;
+			case ScalarValueOp::PcRelativeHigh:
+				out = static_cast<uint32_t>((m_runtime.shader_base + value.imm) >> 32u);
+				break;
+			case ScalarValueOp::Phi: {
+				for (const auto arg: value.phi_args) {
+					if (arg == id) {
+						continue;
+					}
+					const auto branch = Evaluate(arg);
+					if (branch.has_value() && (!out.has_value() || *branch < *out)) {
+						out = branch;
+					}
+				}
+				break;
+			}
+			case ScalarValueOp::ReadConst:
+			case ScalarValueOp::ReadConstBuffer: out = Read(value); break;
+			case ScalarValueOp::Undefined:
+			case ScalarValueOp::Unknown: break;
+			default: {
+				const auto count = ScalarValueArgCount(value.op);
+				if (count >= 1 && count <= 3) {
+					std::array<uint32_t, 3> args {};
+					for (uint32_t i = 0; i < count; i++) {
+						args[i] = Evaluate(value.args[i]).value_or(0);
+					}
+					uint32_t result = 0;
+					if (ApplyOperation(value.op, args, result)) {
+						out = result;
+					}
+				}
+				break;
+			}
+		}
+		m_state[id] = out.has_value() ? 2 : 3;
+		if (out.has_value()) {
+			m_values[id] = *out;
+		}
+		return out;
+	}
+
+private:
+	std::optional<uint32_t> Read(const ScalarValue& value) {
+		const bool buffer = value.op == ScalarValueOp::ReadConstBuffer;
+		const auto lo     = Evaluate(value.args[0]);
+		const auto hi     = Evaluate(value.args[1]);
+		const auto offset = Evaluate(value.args[buffer ? 4u : 2u]);
+		if (!lo.has_value() || !hi.has_value()) {
+			return std::nullopt;
+		}
+		const auto base = (static_cast<uint64_t>(*hi) << 32u | *lo) & AddressMask;
+		const auto immediate =
+		    static_cast<int64_t>(static_cast<int32_t>(value.imm)) & ~int64_t {3};
+		const auto relative = immediate + static_cast<int64_t>(offset.value_or(0) & ~uint32_t {3});
+		uint64_t   address  = 0;
+		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+			return std::nullopt;
+		}
+		// Never fall back to a raw host read here: approximate addresses carry no mapping
+		// guarantee, so without a validating callback the read yields no information.
+		uint32_t result = 0;
+		if (m_runtime.read_memory == nullptr ||
+		    !m_runtime.read_memory(m_runtime.userdata, address, &result)) {
+			return std::nullopt;
+		}
+		return result;
+	}
+
+	const Program&        m_program;
+	const SrtRuntime&     m_runtime;
+	std::vector<uint32_t> m_values;
+	std::vector<uint8_t>  m_state;
+};
+
 } // namespace
 
 bool FoldScalarConstant(const ScalarProvenance& provenance, uint32_t value, uint32_t& result) {
@@ -554,6 +675,21 @@ bool EvaluateDescriptorSource(const Program& program, uint32_t source, uint32_t 
 		return false;
 	}
 	result = results[0];
+	return true;
+}
+
+bool EvaluateDescriptorSourceApprox(const Program& program, uint32_t source,
+	                                const SrtRuntime& runtime, DescriptorValue& result) {
+	const auto* descriptor = GetDescriptorSource(program, source);
+	if (descriptor == nullptr) {
+		return false;
+	}
+	ApproximateEvaluator evaluator(program, runtime);
+	result             = {};
+	result.dword_count = descriptor->dword_count;
+	for (uint32_t i = 0; i < descriptor->dword_count; i++) {
+		result.dwords[i] = evaluator.Evaluate(descriptor->dwords[i]).value_or(0);
+	}
 	return true;
 }
 
@@ -597,6 +733,12 @@ static bool EvaluateRuntimeSourcesImpl(const Program&                           
 		evaluated.push_back(value);
 	}
 	if (evaluate_flat) {
+		// A flat slot on a conditionally-executed path can chase a pointer that is null in
+		// this dispatch's snapshot (the shader guards the real load; the eager walk cannot).
+		// Such slots become zero instead of failing the whole walk — descriptor sources
+		// above still fail hard on unreadable memory.
+		uint32_t    failed_slots = 0;
+		std::string first_failure;
 		for (const auto& read: program.srt.reads) {
 			evaluator.SetUsePc(read.use_pc);
 			if (read.flat_offset >= flattened.size()) {
@@ -605,9 +747,18 @@ static bool EvaluateRuntimeSourcesImpl(const Program&                           
 				}
 				return false;
 			}
-			if (!evaluator.Evaluate(read.value, flattened[read.flat_offset], error)) {
-				return false;
+			std::string slot_error;
+			if (!evaluator.Evaluate(read.value, flattened[read.flat_offset], &slot_error)) {
+				flattened[read.flat_offset] = 0;
+				if (failed_slots == 0) {
+					first_failure = std::move(slot_error);
+				}
+				failed_slots++;
 			}
+		}
+		if (failed_slots != 0) {
+			fprintf(stderr, "srt-walk: hash=0x%016" PRIx64 " %u flat slot(s) unreadable -> 0 (%s)\n",
+			        program.shader_hash, failed_slots, first_failure.c_str());
 		}
 	}
 	results = std::move(evaluated);

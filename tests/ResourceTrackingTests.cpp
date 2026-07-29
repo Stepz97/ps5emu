@@ -2030,6 +2030,108 @@ void TestTextureNullDescriptorUsesAddressBits() {
 
 } // namespace
 
+Instruction FindLsb(uint32_t pc, uint32_t dst, uint32_t src) {
+  Instruction inst;
+  inst.pc = pc;
+  inst.op = Opcode::FindLsbU32;
+  inst.dst = Sgpr(dst);
+  inst.src[0] = Sgpr(src);
+  inst.src_count = 1;
+  return inst;
+}
+
+// A scalar load whose pointer chain contains an Unknown (here via FindLsb, which scalar
+// provenance does not model) must degrade to the dynamic-base window path instead of
+// failing resource tracking, and its reads must never receive flat SRT slots.
+void TestUnknownScalarBaseDegradesToDynamicBase() {
+  Program program;
+  program.blocks.resize(1);
+  auto &insts = program.blocks[0].instructions;
+  insts.push_back(FindLsb(0x00, 20, 24));
+  insts.push_back(Move(0x04, 21, 25));
+  insts.push_back(ScalarLoad(0x08, 4, 20, 8));
+  {
+    auto vsharp_load = ScalarBufferLoad(0x0c, 6, 5, 4);
+    vsharp_load.src[0] = Sgpr(26);
+    vsharp_load.src_count = 1;
+    insts.push_back(vsharp_load);
+  }
+  std::string error;
+  Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error),
+        error.c_str());
+  Check(program.srt.reads.empty(),
+        "unknown-based reads were assigned flat SRT slots");
+  Check(PatchSrtReads(program, &error) && TrackResources(program, &error),
+        error.c_str());
+  const auto &raw_load = program.blocks[0].instructions[2];
+  Check(raw_load.op == Opcode::SLoadDword && raw_load.memory.dynamic_base &&
+            !raw_load.memory.dynamic_base_vsharp &&
+            raw_load.memory.dynamic_base_reg == 20,
+        "raw scalar load did not degrade to the dynamic-base path");
+  const auto &vsharp_load = program.blocks[0].instructions[3];
+  Check(vsharp_load.op == Opcode::SLoadDword &&
+            vsharp_load.memory.dynamic_base &&
+            vsharp_load.memory.dynamic_base_vsharp &&
+            vsharp_load.memory.dynamic_base_reg == 20,
+        "V# scalar load did not degrade to the dynamic-base path");
+  Check(program.info.buffers.empty() && program.info.addresses.size() == 2 &&
+            program.info.addresses[0].dynamic_base &&
+            program.info.addresses[1].dynamic_base &&
+            program.info.addresses[0].kind == ResourceKind::ScalarBuffer,
+        "degraded loads did not become dynamic-base address resources");
+  Check(AllocateBindings(program, {}, &error), error.c_str());
+}
+
+// The dynamic-base window anchor comes from best-effort evaluation: Unknown leaves count
+// as zero, so the anchor collapses to the reachable user-data base, and specialization
+// records the aligned window base.
+void TestDynamicBaseAnchorUsesApproximateEvaluation() {
+  Program program;
+  program.blocks.resize(1);
+  auto &insts = program.blocks[0].instructions;
+  insts.push_back(FindLsb(0x00, 22, 24));
+  {
+    Instruction add;
+    add.pc = 0x04;
+    add.op = Opcode::IAddU32;
+    add.dst = Sgpr(20);
+    add.src[0] = Sgpr(16);
+    add.src[1] = Sgpr(22);
+    add.src_count = 2;
+    insts.push_back(add);
+  }
+  insts.push_back(Move(0x08, 21, 17));
+  insts.push_back(ScalarLoad(0x0c, 4, 20, 0));
+  std::string error;
+  Check(BuildScalarProvenance(program, &error) &&
+            BuildSrtPlan(program, &error) && PatchSrtReads(program, &error) &&
+            TrackResources(program, &error),
+        error.c_str());
+  Check(program.info.addresses.size() == 1 &&
+            program.info.addresses[0].dynamic_base,
+        "load did not become a dynamic-base address resource");
+  std::array<uint32_t, 32> user_data{};
+  user_data[16] = 0x00234560;
+  user_data[17] = 0x3;
+  SrtRuntime runtime;
+  runtime.user_data = user_data;
+  ResourceSnapshot snapshot;
+  Check(MaterializeResources(program, runtime, snapshot, &error),
+        error.c_str());
+  const auto anchor = (uint64_t{user_data[17]} << 32) | user_data[16];
+  Check(snapshot.addresses.size() == 1 &&
+            snapshot.addresses[0].guest_base == anchor &&
+            snapshot.addresses[0].binding_base ==
+                (anchor & ~(DynamicAddressWindowAlign - 1)),
+        "approximate anchor did not collapse Unknown to zero");
+  Check(SpecializeResources(program, snapshot, &error), error.c_str());
+  Check(program.info.addresses[0].specialized_base ==
+            snapshot.addresses[0].binding_base,
+        "dynamic-base specialization did not record the window base");
+  Check(ValidateResourceSpecialization(program, snapshot, &error),
+        error.c_str());
+}
+
 int main() {
   const char *current = "startup";
 #define RUN(test)                                                              \
@@ -2078,6 +2180,8 @@ int main() {
     RUN(TestNativeBindingLayoutHonorsUserDataCount);
     RUN(TestNativeBindingLayoutHonorsUserDataBase);
     RUN(TestTextureNullDescriptorUsesAddressBits);
+    RUN(TestUnknownScalarBaseDegradesToDynamicBase);
+    RUN(TestDynamicBaseAnchorUsesApproximateEvaluation);
     std::cout << "ResourceTrackingTests: all cases passed\n";
     return 0;
   } catch (const std::exception &e) {

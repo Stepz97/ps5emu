@@ -7,6 +7,12 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 constexpr uint64_t FlatAddressWindowSize = 0x10000;
 
+// Dynamic-base address resources bind a wider window because the shader-computed addresses
+// can range over a whole engine data blob (light arrays, embedded descriptor tables); the
+// anchor is aligned down to give slack below the approximate base.
+constexpr uint64_t DynamicAddressWindowSize  = 0x4000000; // 64 MiB
+constexpr uint64_t DynamicAddressWindowAlign = 0x10000;   // 64 KiB
+
 struct ResourceSnapshot {
 	struct Address {
 		uint64_t guest_base   = 0;

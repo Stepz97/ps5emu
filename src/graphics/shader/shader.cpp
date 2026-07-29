@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.h"
@@ -214,6 +215,19 @@ static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 	}
 
 	return nullptr;
+}
+
+bool ShaderReadGuestMemory(void* /*userdata*/, uint64_t address, uint32_t* value) {
+	// Same semantics as the historical direct host read (page-protection faults still drive
+	// the memory tracker), but unmapped addresses fail instead of faulting — the approximate
+	// window-anchor evaluation feeds this reader addresses with no mapping guarantee.
+	uint64_t mapped = 0;
+	if (!HostMemoryQueryRange(address, sizeof(*value), HostMemoryAccess::Mapped, mapped) ||
+	    mapped < sizeof(*value)) {
+		return false;
+	}
+	std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+	return true;
 }
 
 static std::span<const uint32_t> ShaderGetMappedCode(uint64_t shader_addr, const char* label,
@@ -918,7 +932,7 @@ static bool TryUseVertexPermutation(const ShaderProgramPermutation& permutation,
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
 	        std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr),
-	        regs.es_regs.data_addr, info.stage, &error)) {
+	        regs.es_regs.data_addr, info.stage, &error, ShaderReadGuestMemory)) {
 		return LogPermutationMismatch(permutation, "VS", shader_hash, error);
 	}
 	ApplyVertexOutputs(info, *permutation.program);
@@ -932,7 +946,7 @@ static bool TryUsePixelPermutation(const ShaderProgramPermutation& permutation,
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
 	        std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr),
-	        regs.ps_regs.data_addr, info.stage, &error)) {
+	        regs.ps_regs.data_addr, info.stage, &error, ShaderReadGuestMemory)) {
 		return LogPermutationMismatch(permutation, "PS", shader_hash, error);
 	}
 	ApplyPixelOutputs(info, *permutation.program);
@@ -946,7 +960,7 @@ static bool TryUseComputePermutation(const ShaderProgramPermutation& permutation
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
 	        std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr),
-	        regs.cs_regs.data_addr, info.stage, &error)) {
+	        regs.cs_regs.data_addr, info.stage, &error, ShaderReadGuestMemory)) {
 		return LogPermutationMismatch(permutation, "CS", shader_hash, error);
 	}
 	return true;
@@ -1399,6 +1413,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler VS";
+	options.read_memory          = ShaderReadGuestMemory;
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
@@ -1452,6 +1467,7 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler PS";
+	options.read_memory          = ShaderReadGuestMemory;
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
@@ -1502,6 +1518,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler CS";
+	options.read_memory          = ShaderReadGuestMemory;
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;

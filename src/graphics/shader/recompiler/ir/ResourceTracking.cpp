@@ -172,17 +172,38 @@ public:
 		if (!m_program.srt_patching_complete) {
 			return Fail(0, error, "SRT reads were not patched");
 		}
+		// Keep scanning after a failed instruction so one report lists every unresolved
+		// descriptor source instead of only the first.
+		std::string all_failures;
 		for (auto& block: m_program.blocks) {
 			for (auto& inst: block.instructions) {
-				if (!Collect(inst, error)) {
-					return false;
+				std::string local;
+				if (!Collect(inst, &local)) {
+					if (!all_failures.empty()) {
+						all_failures += '\n';
+					}
+					all_failures += local;
 				}
 			}
+		}
+		if (!all_failures.empty()) {
+			if (error != nullptr) {
+				*error = all_failures;
+			}
+			return false;
 		}
 		LinkImageAliases();
 		m_program.info = std::move(m_info);
 		for (const auto& patch: m_patches) {
-			auto& inst                  = patch.inst.get();
+			auto& inst = patch.inst.get();
+			if (patch.degrade_dynamic_base) {
+				inst.memory.dynamic_base        = true;
+				inst.memory.dynamic_base_vsharp = patch.degrade_vsharp;
+				inst.memory.dynamic_base_reg    = patch.degrade_base_reg;
+				if (patch.degrade_vsharp) {
+					inst.op = Opcode::SLoadDword;
+				}
+			}
 			inst.memory.resource        = patch.resource;
 			inst.memory.sampler         = patch.sampler;
 			inst.memory.resource_source = ScalarProvenance::Undefined;
@@ -195,8 +216,13 @@ public:
 private:
 	struct Patch {
 		std::reference_wrapper<Instruction> inst;
-		uint32_t                            resource = 0;
-		uint32_t                            sampler  = 0;
+		uint32_t                            resource         = 0;
+		uint32_t                            sampler          = 0;
+		// Deferred dynamic-base degradation, applied with the rest of the patch so a later
+		// collection failure leaves the program untouched.
+		bool     degrade_dynamic_base = false;
+		bool     degrade_vsharp       = false;
+		uint32_t degrade_base_reg     = 0;
 	};
 
 	bool Fail(uint32_t pc, std::string* error, const std::string& reason) const {
@@ -207,16 +233,26 @@ private:
 		return false;
 	}
 
-	bool ValidateSource(uint32_t source, uint32_t dwords, uint32_t pc, std::string* error) const {
+	bool ValidateSource(const Instruction& inst, uint32_t source, uint32_t dwords,
+	                    std::string* error, bool* contains_unknown = nullptr) const {
+		const auto  pc      = inst.pc;
+		const auto  context = fmt::format("op={} kind={} component={}/{}",
+		                                  static_cast<uint32_t>(inst.op),
+		                                  static_cast<uint32_t>(inst.memory.kind),
+		                                  inst.memory.component_index, inst.memory.component_count);
 		const auto* descriptor = GetDescriptorSource(m_program, source);
 		if (descriptor == nullptr || descriptor->dword_count != dwords) {
 			return Fail(pc, error,
-			            fmt::format("descriptor source {} is missing or has wrong width", source));
+			            fmt::format("descriptor source {} is missing or has wrong width ({})",
+			                        source, context));
 		}
 		std::vector<uint8_t> visited(m_program.provenance.values.size());
 		for (uint32_t i = 0; i < descriptor->dword_count; i++) {
 			std::vector<uint32_t> path;
 			if (ContainsUnknown(m_program.provenance, descriptor->dwords[i], visited, path)) {
+				if (contains_unknown != nullptr) {
+					*contains_unknown = true;
+				}
 				const auto  value = descriptor->dwords[i];
 				std::string chain;
 				for (const auto id: path) {
@@ -229,8 +265,9 @@ private:
 				return Fail(
 				    pc, error,
 				    fmt::format(
-				        "descriptor source {} dword {} contains an unknown value {} ({}) path {}",
-				        source, i, value, ScalarValueToString(m_program.provenance, value), chain));
+				        "descriptor source {} dword {} contains an unknown value {} ({}) [{}] path {}",
+				        source, i, value, ScalarValueToString(m_program.provenance, value), context,
+				        chain));
 			}
 		}
 		const auto dynamic =
@@ -336,16 +373,19 @@ private:
 		return static_cast<uint32_t>(m_info.images.size() - 1);
 	}
 
-	uint32_t AddAddress(const Instruction& inst) {
+	uint32_t AddAddress(const Instruction& inst, bool dynamic = false) {
 		auto immediate = static_cast<int32_t>(inst.memory.offset);
 		if (inst.memory.kind == ResourceKind::ScalarBuffer) {
 			immediate = static_cast<int32_t>(static_cast<uint32_t>(immediate) & ~3u);
 		}
 		const auto min_offset =
-		    inst.memory.resource_source == ScalarProvenance::Unknown ? 0 : std::min(immediate, 0);
+		    inst.memory.resource_source == ScalarProvenance::Unknown || dynamic
+		        ? 0
+		        : std::min(immediate, 0);
 		for (uint32_t i = 0; i < m_info.addresses.size(); i++) {
 			auto& address = m_info.addresses[i];
-			if (address.source == inst.memory.resource_source && address.kind == inst.memory.kind) {
+			if (address.source == inst.memory.resource_source && address.kind == inst.memory.kind &&
+			    address.dynamic_base == dynamic) {
 				address.first_use_pc = std::min(address.first_use_pc, inst.pc);
 				address.min_offset   = std::min(address.min_offset, min_offset);
 				address.read         = address.read || !IsWrite(inst.op) || IsAtomic(inst.op);
@@ -359,11 +399,30 @@ private:
 		}
 		AddressResource address {inst.memory.resource_source, inst.pc, inst.memory.kind,
 		                         min_offset};
-		address.read    = !IsWrite(inst.op) || IsAtomic(inst.op);
-		address.written = IsWrite(inst.op);
-		address.atomic  = IsAtomic(inst.op);
+		address.read         = !IsWrite(inst.op) || IsAtomic(inst.op);
+		address.written      = IsWrite(inst.op);
+		address.atomic       = IsAtomic(inst.op);
+		address.dynamic_base = dynamic;
 		m_info.addresses.push_back(address);
 		return static_cast<uint32_t>(m_info.addresses.size() - 1);
+	}
+
+	// Lowers a scalar load whose descriptor chain contains an Unknown to the dynamic-base
+	// path: the emitted shader computes the full guest address from the live SGPRs that
+	// already hold it, and translates it against a window anchored per dispatch by
+	// best-effort evaluation of this same source chain. The instruction itself is only
+	// rewritten when the whole collection succeeds.
+	bool DegradeToDynamicBase(Instruction& inst, bool vsharp, std::string* error) {
+		const auto resource = AddAddress(inst, true);
+		if (resource == UINT32_MAX) {
+			return Fail(inst.pc, error, "address resource limit exceeded");
+		}
+		Patch patch {std::ref(inst), resource, 0};
+		patch.degrade_dynamic_base = true;
+		patch.degrade_vsharp       = vsharp;
+		patch.degrade_base_reg     = vsharp ? inst.memory.resource * 4u : inst.memory.resource;
+		m_patches.push_back(patch);
+		return true;
 	}
 
 	void Merge(ImageResource* resource, const Instruction& inst) const {
@@ -405,11 +464,19 @@ private:
 	bool Collect(Instruction& inst, std::string* error) {
 		if (IsAddress(inst)) {
 			const bool unbased = inst.memory.resource_source == ScalarProvenance::Unknown;
-			if ((!unbased && !ValidateSource(inst.memory.resource_source, 2, inst.pc, error)) ||
-			    (unbased && inst.memory.kind != ResourceKind::Flat &&
-			     inst.memory.kind != ResourceKind::Global &&
-			     inst.memory.kind != ResourceKind::Scratch)) {
-				return unbased ? Fail(inst.pc, error, "scalar memory base is unresolved") : false;
+			if (!unbased) {
+				bool contains_unknown = false;
+				if (!ValidateSource(inst, inst.memory.resource_source, 2, error,
+				                    &contains_unknown)) {
+					if (contains_unknown && inst.op == Opcode::SLoadDword) {
+						return DegradeToDynamicBase(inst, false, error);
+					}
+					return false;
+				}
+			} else if (inst.memory.kind != ResourceKind::Flat &&
+			           inst.memory.kind != ResourceKind::Global &&
+			           inst.memory.kind != ResourceKind::Scratch) {
+				return Fail(inst.pc, error, "scalar memory base is unresolved");
 			}
 			const auto resource = AddAddress(inst);
 			if (resource == UINT32_MAX) {
@@ -421,9 +488,16 @@ private:
 		if (!IsBuffer(inst) && !IsImage(inst)) {
 			return true;
 		}
-		if (!ValidateSource(inst.memory.resource_source, IsBuffer(inst) ? 4u : 8u, inst.pc,
-		                    error)) {
-			return false;
+		{
+			bool contains_unknown = false;
+			if (!ValidateSource(inst, inst.memory.resource_source, IsBuffer(inst) ? 4u : 8u,
+			                    error, &contains_unknown)) {
+				if (contains_unknown && inst.op == Opcode::SBufferLoadDword &&
+				    inst.memory.kind == ResourceKind::ScalarBuffer) {
+					return DegradeToDynamicBase(inst, true, error);
+				}
+				return false;
+			}
 		}
 		const auto resource = IsBuffer(inst) ? AddBuffer(inst) : AddImage(inst);
 		if (resource == UINT32_MAX) {
@@ -433,7 +507,7 @@ private:
 		}
 		uint32_t sampler = 0;
 		if (NeedsSampler(inst.op)) {
-			if (!ValidateSource(inst.memory.sampler_source, 4, inst.pc, error)) {
+			if (!ValidateSource(inst, inst.memory.sampler_source, 4, error)) {
 				return false;
 			}
 			sampler = AddSampler(inst);
