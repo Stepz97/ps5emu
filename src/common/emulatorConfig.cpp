@@ -69,6 +69,10 @@ bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }
 
+std::filesystem::path GetDumpScanOutPath() {
+	return g_config->dump_scanout_path;
+}
+
 OutputDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }
