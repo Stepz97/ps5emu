@@ -2749,47 +2749,44 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
-__attribute__((noinline, returns_twice)) static int FiberSaveContext(FiberCpuContext* ctx) {
-	int ret = 0;
-	asm volatile("movq %[ctx], %%r10\n\t"
-	             "movq %%rbx, 0(%%r10)\n\t"
-	             "movq %%rbp, 8(%%r10)\n\t"
-	             "movq %%rdi, 16(%%r10)\n\t"
-	             "movq %%rsi, 24(%%r10)\n\t"
-	             "movq %%r12, 32(%%r10)\n\t"
-	             "movq %%r13, 40(%%r10)\n\t"
-	             "movq %%r14, 48(%%r10)\n\t"
-	             "movq %%r15, 56(%%r10)\n\t"
-	             "leaq 8(%%rsp), %%r11\n\t"
-	             "movq %%r11, 64(%%r10)\n\t"
-	             "movq (%%rsp), %%r11\n\t"
-	             "movq %%r11, 72(%%r10)\n\t"
-	             "xorl %%eax, %%eax\n\t"
-	             : "=a"(ret)
-	             : [ctx] "r"(ctx)
-	             : "memory", "r10", "r11");
-	return ret;
+// These two primitives MUST NOT have a compiler-generated prologue. Apple clang keeps the frame
+// pointer by default, so a regular function pushes %rbp before the asm runs and (%rsp) then holds
+// the saved frame pointer instead of the return address — the restored context would jump into
+// the stack (AccessViolation/Execute at a stack address). Naked functions guarantee that on entry
+// (%rsp) is the return address and no register has been touched. SysV ABI: ctx arrives in %rdi.
+__attribute__((naked, returns_twice)) static int FiberSaveContext(FiberCpuContext* ctx) {
+	asm volatile("movq %rbx, 0(%rdi)\n\t"
+	             "movq %rbp, 8(%rdi)\n\t"
+	             "movq %rdi, 16(%rdi)\n\t"
+	             "movq %rsi, 24(%rdi)\n\t"
+	             "movq %r12, 32(%rdi)\n\t"
+	             "movq %r13, 40(%rdi)\n\t"
+	             "movq %r14, 48(%rdi)\n\t"
+	             "movq %r15, 56(%rdi)\n\t"
+	             "leaq 8(%rsp), %r11\n\t" // rsp after the ret below pops the return address
+	             "movq %r11, 64(%rdi)\n\t"
+	             "movq (%rsp), %r11\n\t" // return address = resume rip
+	             "movq %r11, 72(%rdi)\n\t"
+	             "xorl %eax, %eax\n\t"
+	             "retq\n\t");
 }
 
-__attribute__((noreturn, noinline)) static void FiberRestoreContext(FiberCpuContext* ctx,
-                                                                    uint64_t         ret) {
-	asm volatile("movq %[ctx], %%r10\n\t"
-	             "movq 72(%%r10), %%r11\n\t"
-	             "movq 0(%%r10), %%rbx\n\t"
-	             "movq 8(%%r10), %%rbp\n\t"
-	             "movq 16(%%r10), %%rdi\n\t"
-	             "movq 24(%%r10), %%rsi\n\t"
-	             "movq 32(%%r10), %%r12\n\t"
-	             "movq 40(%%r10), %%r13\n\t"
-	             "movq 48(%%r10), %%r14\n\t"
-	             "movq 56(%%r10), %%r15\n\t"
-	             "movq 64(%%r10), %%rsp\n\t"
-	             "movq %[ret], %%rax\n\t"
-	             "jmp *%%r11\n\t"
-	             :
-	             : [ctx] "r"(ctx), [ret] "r"(ret)
-	             : "memory", "rax", "r10", "r11");
-	__builtin_unreachable();
+// SysV ABI: ctx in %rdi, ret in %rsi. %rax is loaded from %rsi before %rsi is overwritten and
+// %rdi is restored last, for the same reason.
+__attribute__((naked, noreturn)) static void FiberRestoreContext(FiberCpuContext* ctx,
+                                                                 uint64_t         ret) {
+	asm volatile("movq %rsi, %rax\n\t"
+	             "movq 72(%rdi), %r11\n\t"
+	             "movq 0(%rdi), %rbx\n\t"
+	             "movq 8(%rdi), %rbp\n\t"
+	             "movq 24(%rdi), %rsi\n\t"
+	             "movq 32(%rdi), %r12\n\t"
+	             "movq 40(%rdi), %r13\n\t"
+	             "movq 48(%rdi), %r14\n\t"
+	             "movq 56(%rdi), %r15\n\t"
+	             "movq 64(%rdi), %rsp\n\t"
+	             "movq 16(%rdi), %rdi\n\t"
+	             "jmp *%r11\n\t");
 }
 #else
 static int FiberSaveContext(FiberCpuContext* ctx) {
