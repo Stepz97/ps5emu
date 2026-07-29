@@ -130,14 +130,25 @@ NativeAddressBuffer(RenderContext& context, CommandBuffer& command_buffer,
 	if (resource.written) {
 		EXIT("writable address resources are unsupported\n");
 	}
-	const auto limit =
+	auto limit =
 	    resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
 	        ? ShaderRecompiler::IR::FlatAddressWindowSize
 	        : static_cast<uint64_t>(
 	              context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	if (resource.dynamic_base) {
+		limit = std::min(limit, ShaderRecompiler::IR::DynamicAddressWindowSize);
+	}
 	uint64_t   size   = 0;
 	const auto access = HostMemoryAccess::Mapped;
 	if (!HostMemoryQueryRange(address.binding_base, limit, access, size)) {
+		if (resource.dynamic_base) {
+			// The approximate anchor can land outside any mapping; reads fall back to zero
+			// instead of killing the emulator.
+			LOGF("dynamic address window is not host-accessible: base=0x%016" PRIx64 "\n",
+			     address.binding_base);
+			BindNullStorageBuffer(context, result);
+			return result;
+		}
 		EXIT("address resource is not host-accessible: base=0x%016" PRIx64 "\n",
 		     address.binding_base);
 	}

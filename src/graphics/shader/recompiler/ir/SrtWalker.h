@@ -33,6 +33,12 @@ bool EvaluateDescriptorSource(const Program& program, uint32_t source, uint32_t 
                               const SrtRuntime& runtime, DescriptorValue& result,
                               std::string* error);
 
+// Best-effort anchor evaluation for dynamic-base address windows: never fails on Unknown
+// leaves or unreadable memory (those dwords become zero), and loop phis resolve to the
+// minimum over their informative branches. Returns false only for an invalid source id.
+bool EvaluateDescriptorSourceApprox(const Program& program, uint32_t source,
+	                                const SrtRuntime& runtime, DescriptorValue& result);
+
 // Evaluates one runtime snapshot transactionally. Scalar values and ReadConst results shared by
 // several descriptors are memoized once across the batch.
 bool EvaluateDescriptorSources(const Program&                           program,

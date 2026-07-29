@@ -28,6 +28,7 @@ enum class ShaderLaneMaskMode { NativeWave, PerInvocation };
 namespace ShaderRecompiler::IR {
 struct Program;
 struct ResourceSnapshot;
+using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
 } // namespace ShaderRecompiler::IR
 
 struct ShaderStageRuntime {
@@ -40,10 +41,12 @@ struct ShaderStageRuntime {
 };
 
 // Resolves an immutable native shader plan against current user data. The prior stage is preserved
-// if any ReadConst, snapshot, or specialization check fails.
+// if any ReadConst, snapshot, or specialization check fails. read_memory validates guest reads
+// (dynamic-base window anchors need it); with nullptr the walk falls back to raw host reads.
 bool ShaderMaterializeStageRuntime(std::shared_ptr<const ShaderRecompiler::IR::Program> program,
                                    std::span<const uint32_t> user_data, uint64_t shader_base,
-                                   ShaderStageRuntime& stage, std::string* error);
+                                   ShaderStageRuntime& stage, std::string* error,
+                                   ShaderRecompiler::IR::SrtMemoryReader read_memory = nullptr);
 
 struct ShaderId {
 	uint32_t              hash0 = 0;
@@ -216,6 +219,10 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+
+// Validating SrtMemoryReader over the guest memory backing: fails instead of faulting on
+// unmapped addresses, which the approximate window-anchor evaluation depends on.
+bool ShaderReadGuestMemory(void* userdata, uint64_t address, uint32_t* value);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

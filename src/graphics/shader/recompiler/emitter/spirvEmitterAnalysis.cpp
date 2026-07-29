@@ -231,6 +231,12 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>& 
 			    inst.memory.kind == IR::ResourceKind::ScalarBuffer) {
 				CollectRegister(registers, {IR::RegisterFile::Scalar, inst.memory.resource * 4u});
 			}
+			if (inst.memory.dynamic_base) {
+				CollectRegister(registers,
+				                {IR::RegisterFile::Scalar, inst.memory.dynamic_base_reg});
+				CollectRegister(registers,
+				                {IR::RegisterFile::Scalar, inst.memory.dynamic_base_reg + 1u});
+			}
 			if ((inst.op == IR::Opcode::ImageSample || inst.op == IR::Opcode::ImageGather4) &&
 			    inst.memory.image_address_components > 1u) {
 				CollectSequentialRegisters(registers, inst.dst, inst.memory.data_dwords);
