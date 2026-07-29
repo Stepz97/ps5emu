@@ -452,7 +452,30 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (num_bytes == 0) {
 		return;
 	}
-	EXIT_NOT_IMPLEMENTED((num_bytes & 3u) != 0);
+	// dst_sel 2 = DST_NOWHERE: the copy discards its destination. Drivers use it for CP DMA
+	// prefetch and drain tricks (seen: 1-byte src_sel=3 dst=0x1); DMAs run synchronously here,
+	// so a copy to nowhere has no architectural effect.
+	if (dst_sel == 2) {
+		LOGF("\t dmaData: discard-destination no-op (src_sel=%u num_bytes=%u)\n", src_sel,
+		     num_bytes);
+		return;
+	}
+	if ((num_bytes & 3u) != 0) {
+		// A 1-byte memory-to-memory copy is the CP DMA drain idiom: AMD drivers (and PS5
+		// titles) issue it to wait for the DMA engine to go idle, pointing at scratch
+		// addresses that can live in the guest null page (seen: src=0x4 dst=0x2). DMAs run
+		// synchronously here, so draining is a no-op — and it must not execute as a real
+		// copy. Genuinely unaligned transfers still abort with their parameters below.
+		if (num_bytes == 1 && dst_sel == 3 && src_sel == 3) {
+			LOGF("\t dmaData: 1-byte drain no-op (dst=0x%016" PRIx64 ")\n",
+			     dst_address_or_offset);
+			return;
+		}
+		EXIT("unaligned dmaData size: num_bytes=%u dst_sel=%u src_sel=%u dst=0x%016" PRIx64
+		     " src_or_imm=0x%016" PRIx64 "\n",
+		     num_bytes, dst_sel, src_sel, dst_address_or_offset,
+		     src_address_or_offset_or_immediate);
+	}
 	EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
 	EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
 	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
