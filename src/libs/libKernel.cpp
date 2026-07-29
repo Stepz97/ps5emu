@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <string>
@@ -474,6 +475,63 @@ static KYTY_SYSV_ABI int sigprocmask(int /*how*/, const void* /*set*/, void* /*o
 	// LOGF("\t set = %016" PRIx64 "\n", reinterpret_cast<uint64_t>(set));
 	// LOGF("\t oset = %016" PRIx64 "\n", reinterpret_cast<uint64_t>(oset));
 
+	return 0;
+}
+
+// FreeBSD/PS4 ABI: 128-bit signal set (4x uint32), not the guest's sigset_t used elsewhere.
+struct SceKernelSigset {
+	uint32_t bits[4];
+};
+
+struct SceKernelSigaction {
+	uint64_t         handler; // union sa_handler/sa_sigaction; SIG_DFL=0, SIG_IGN=1
+	int32_t          sa_flags;
+	SceKernelSigset  sa_mask;
+};
+
+constexpr int POSIX_SIG_MAX = 128; // FreeBSD _SIG_MAXSIG
+
+// Table of installed POSIX sigaction()s, indexed by signal number. Deliberately separate from
+// g_exception_handlers/KernelInstallExceptionHandler below: that API has single-registration
+// (EAGAIN if already set) + allow-listed signals, while sigaction() must allow free overwrite
+// and oact readback for any signal in range. raise() (further below in this file) reads this same
+// table under this same mutex, so a handler installed via sigaction() actually gets dispatched.
+static SceKernelSigaction g_posix_sigactions[POSIX_SIG_MAX] = {};
+static Common::Mutex      g_posix_sigactions_mutex;
+
+static KYTY_SYSV_ABI int sigaction(int sig, const SceKernelSigaction* act, SceKernelSigaction* oact) {
+	PRINT_NAME();
+
+	LOGF("\t sig  = %d\n"
+	     "\t act  = 0x%016" PRIx64 "\n"
+	     "\t oact = 0x%016" PRIx64 "\n",
+	     sig, reinterpret_cast<uint64_t>(act), reinterpret_cast<uint64_t>(oact));
+
+	if (sig <= 0 || sig >= POSIX_SIG_MAX) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+
+	// Copy the new action out to a local BEFORE touching *oact: if the guest passes the same
+	// pointer for act and oact (swap-in-place idiom), writing *oact first would clobber the very
+	// buffer this read depends on, silently installing a copy of the OLD action instead.
+	SceKernelSigaction new_action {};
+	if (act != nullptr) {
+		new_action = *act;
+	}
+
+	{
+		Common::LockGuard lock(g_posix_sigactions_mutex);
+		if (oact != nullptr) {
+			*oact = g_posix_sigactions[sig];
+		}
+		if (act != nullptr) {
+			g_posix_sigactions[sig] = new_action;
+		}
+	}
+
+	// No real signal delivery: hello_world's CRT installs a handler but this boot path never
+	// triggers a fault or sends a real signal to the guest thread.
 	return 0;
 }
 
@@ -1438,6 +1496,147 @@ static int64_t KYTY_SYSV_ABI read(int d, void* buf, uint64_t nbytes) {
 	return (str != nullptr ? static_cast<int64_t>(strlen(str)) : 0);
 }
 
+// Guest ABI iovec: {void* iov_base; size_t iov_len;} — 16 bytes, identical layout on the x86-64
+// guest and host, no translation needed.
+struct KernelIovec {
+	void*  iov_base;
+	size_t iov_len;
+};
+
+static int64_t KYTY_SYSV_ABI writev(int d, const KernelIovec* iov, int iovcnt) {
+	PRINT_NAME();
+
+	constexpr int IOV_MAX_COUNT = 1024; // FreeBSD/PS4 IOV_MAX
+
+	if (iov == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return -1;
+	}
+	if (iovcnt <= 0 || iovcnt > IOV_MAX_COUNT) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+
+	int64_t total = 0;
+
+	for (int i = 0; i < iovcnt; i++) {
+		if (iov[i].iov_len == 0) {
+			continue; // a zero-length iovec is valid POSIX, no-op
+		}
+		if (iov[i].iov_base == nullptr) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+			return (total > 0 ? total : -1);
+		}
+
+		auto result = FileSystem::KernelWrite(d, iov[i].iov_base, iov[i].iov_len);
+
+		if (result < 0) {
+			if (total > 0) {
+				return total; // POSIX partial-write convention: report what was already written
+			}
+			*Posix::GetErrorAddr() = KernelToPosix(static_cast<int>(result));
+			return -1;
+		}
+
+		total += result;
+
+		if (static_cast<size_t>(result) != iov[i].iov_len) {
+			// Short write on this segment (disk full/quota/etc): stop here instead of advancing
+			// to the next iovec, matching real writev()'s partial-write contract and avoiding a
+			// discontiguous/corrupted stream.
+			break;
+		}
+	}
+
+	return total;
+}
+
+static void* KYTY_SYSV_ABI mmap(void* addr, size_t len, int prot, int flags, int fd, int64_t offset) {
+	PRINT_NAME();
+
+	LOGF("\t addr=0x%016" PRIx64 " len=0x%016" PRIx64 " prot=0x%x flags=0x%x fd=%d offset=0x%016" PRIx64
+	     "\n",
+	     reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(len), prot, flags, fd,
+	     static_cast<uint64_t>(offset));
+
+	constexpr size_t MMAP_PAGE_SIZE = 0x4000; // matches Memory::KernelMapNamedFlexibleMemory's PAGE_SIZE
+	constexpr int    GUEST_MAP_ANON = 0x1000; // matches memory.cpp's GUEST_MAP_ANON
+
+	// Supported bitmask matching DecodeMemoryProtection (memory.cpp): PROT_CPU_READ|WRITE|EXEC and
+	// PROT_GPU_READ|WRITE. Guest input must NEVER be allowed to reach DecodeMemoryProtection's
+	// unknown-prot EXIT()/std::_Exit() path from a POSIX syscall entry point — fail with EINVAL here
+	// instead.
+	constexpr int PROT_SUPPORTED_MASK = 0x01 | 0x02 | 0x04 | 0x10 | 0x20;
+	if (prot != 0 && (prot & ~PROT_SUPPORTED_MASK) != 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return reinterpret_cast<void*>(-1);
+	}
+
+	if (len == 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return reinterpret_cast<void*>(-1);
+	}
+
+	// Reject before rounding if the PAGE_ALIGN() computation below would overflow to 0 (len within
+	// MMAP_PAGE_SIZE-1 of SIZE_MAX): a request too large to ever be satisfied is ENOMEM, not the
+	// generic EINVAL that an overflowed-to-zero aligned_len would otherwise produce.
+	if (len > (std::numeric_limits<size_t>::max)() - (MMAP_PAGE_SIZE - 1)) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+		return reinterpret_cast<void*>(-1);
+	}
+
+	// POSIX mmap() rounds the length up to the page size; KernelMapNamedFlexibleMemory instead
+	// hard-rejects a non-page-aligned len (EINVAL), so round up ourselves.
+	size_t aligned_len = (len + MMAP_PAGE_SIZE - 1) & ~(MMAP_PAGE_SIZE - 1);
+
+	// Minimum viable: anonymous mappings only (covers the libc heap-growth call blocking boot).
+	// File-backed mmap (real fd, no MAP_ANON) is not implemented by the reused infra.
+	if (fd != -1 && (flags & GUEST_MAP_ANON) == 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENODEV;
+		return reinterpret_cast<void*>(-1);
+	}
+
+	void* addr_out = addr;
+	int   result   = Memory::KernelMapNamedFlexibleMemory(&addr_out, aligned_len, prot, flags, "mmap");
+	if (result != OK) {
+		*Posix::GetErrorAddr() = KernelToPosix(result);
+		return reinterpret_cast<void*>(-1);
+	}
+	return addr_out;
+}
+
+static int KYTY_SYSV_ABI ioctl(int fd, uint64_t /*request*/, void* /*argp*/) {
+	// PRINT_NAME();
+
+	if (fd < 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
+
+	if (Network::Net::IsSocket(fd)) {
+		// Mirror write()/read()/close() in this file: route sockets through Network::Net BEFORE
+		// falling into the fd-range branching below. Sockets live at fd >= SOCKET_FD_MIN (128), so
+		// without this check every socket ioctl() fell through to the "fd > 2" branch below and got
+		// an unconditional ENOTTY, which is the wrong error (ENOTTY means "wrong fd type", but the
+		// real gap is that ioctl() has no socket backend yet — matching every other non-Windows
+		// socket op in network.cpp, which all return ENOSYS today).
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
+		return -1;
+	}
+
+	if (fd <= 2) {
+		// stdin/stdout/stderr: kyty has no real tty/device model yet. Unconditionally succeed
+		// regardless of `request` (no struct is ever filled) — enough for libc's isatty()-style
+		// probe (`_ioctl(fd, TIOCGETA, &t)`) that OpenOrbis' CRT runs before its first buffered
+		// stdio write.
+		return 0;
+	}
+
+	// Any other descriptor: not a device/tty, matches real POSIX ioctl() on a regular file.
+	*Posix::GetErrorAddr() = Posix::POSIX_ENOTTY;
+	return -1;
+}
+
 static bool DecodeEhFramePointer(const uint8_t* data, const uint8_t* end, uint8_t encoding,
                                  uint64_t field_addr, uint64_t* value) {
 	EXIT_IF(value == nullptr);
@@ -1856,6 +2055,29 @@ int KYTY_SYSV_ABI getpagesize() {
 	return 0x4000;
 }
 
+// _SC_* numeric values below come from the OpenOrbis PS4Toolchain's own unistd.h (the header that
+// actually compiled hello_world's eboot.bin) — they do NOT match glibc/FreeBSD canonical numbering.
+int64_t KYTY_SYSV_ABI sysconf(int name) {
+	PRINT_NAME();
+
+	switch (name) {
+	case 30: // _SC_PAGESIZE == _SC_PAGE_SIZE
+		return 0x4000; // must stay in lockstep with getpagesize() above
+	case 83: // _SC_NPROCESSORS_CONF
+	case 84: // _SC_NPROCESSORS_ONLN
+		// Hardcoded to the emulated PS4/PS5 topology, the same way _SC_PAGESIZE above hardcodes
+		// 0x4000 instead of querying the host: the host's hardware_concurrency() can be 2-3x a
+		// many-core Mac's count, which some titles use to size a one-thread-per-core pool and were
+		// never tested with that many workers on real hardware.
+		return 8;
+	case 2: // _SC_CLK_TCK
+		return 100;
+	default:
+		*GetErrorAddr() = POSIX_EINVAL;
+		return -1;
+	}
+}
+
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {
 	PRINT_NAME();
 
@@ -1897,6 +2119,48 @@ int KYTY_SYSV_ABI nanosleep(const LibKernel::KernelTimespec* rqtp,
 	PRINT_NAME();
 
 	return POSIX_CALL(LibKernel::KernelNanosleep(rqtp, rmtp));
+}
+
+int KYTY_SYSV_ABI raise(int sig) {
+	PRINT_NAME();
+
+	LOGF("\t sig = %d\n", sig);
+
+	// raise() is distinct from sceKernelRaiseException (NID il03nluKfMk): it always targets the
+	// calling thread, never an explicit Pthread. Two disposition tables can hold a handler for this
+	// signal, and both must be consulted: g_posix_sigactions, populated by the POSIX sigaction()
+	// above (the table the vast majority of portable guest code actually installs a handler
+	// through), and g_exception_handlers, populated only by the separate, Sony-specific
+	// sceKernelInstallExceptionHandler API for an allow-listed signal subset. Previously raise()
+	// only checked the latter, so a handler installed via sigaction() never ran.
+	// NEVER forward to the host's ::raise()/abort()/exit(): that would kill the whole emulator
+	// process, not just the guest thread.
+	if (sig > 0 && sig < LibKernel::POSIX_SIG_MAX) {
+		uint64_t posix_handler = 0;
+		{
+			Common::LockGuard lock(LibKernel::g_posix_sigactions_mutex);
+			posix_handler = LibKernel::g_posix_sigactions[sig].handler;
+		}
+		// handler==0 is SIG_DFL and handler==1 is SIG_IGN (see SceKernelSigaction) — neither is a
+		// callable function pointer, so only dispatch for an actually-installed handler.
+		if (posix_handler != 0 && posix_handler != 1) {
+			auto* handler = reinterpret_cast<LibKernel::exception_handler_func_t>(posix_handler);
+			auto  ctx     = LibKernel::CreateSignalUcontext();
+			handler(sig, &ctx);
+			return 0;
+		}
+	}
+
+	if (LibKernel::IsAllowedExceptionSignal(sig)) {
+		auto* handler =
+		    reinterpret_cast<LibKernel::exception_handler_func_t>(LibKernel::g_exception_handlers[sig]);
+		if (handler != nullptr) {
+			auto ctx = LibKernel::CreateSignalUcontext();
+			handler(sig, &ctx);
+		}
+	}
+
+	return 0;
 }
 
 int KYTY_SYSV_ABI stat(const char* path, LibKernel::FileSystem::FileStat* sb) {
@@ -2005,6 +2269,55 @@ int KYTY_SYSV_ABI select(int nfds, void* readfds, void* writefds, void* exceptfd
 	return Network::Net::Select(nfds, readfds, writefds, exceptfds, timeout);
 }
 
+// Guest ABI struct pollfd (FreeBSD/PS4): {int fd; short events; short revents;} — 8 bytes.
+struct PollFd {
+	int32_t fd;
+	int16_t events;
+	int16_t revents;
+};
+static_assert(sizeof(PollFd) == 8);
+
+constexpr int16_t POSIX_POLLIN  = 0x0001;
+constexpr int16_t POSIX_POLLOUT = 0x0004;
+
+int KYTY_SYSV_ABI poll(PollFd* fds, uint64_t nfds, int timeout) {
+	PRINT_NAME();
+
+	// No real host-side readiness tracking for guest fds yet. Always report every requested fd
+	// as ready instead of ever blocking: a timeout=-1 (infinite) must not hang the guest thread
+	// waiting on an event kyty cannot produce. Semantics taken from sharpemu-ref
+	// (KernelFileExtendedExports.cs): regular fds are always ready for read/write.
+	//
+	// `timeout` (milliseconds) IS honored for the "nothing became ready" case: guest code commonly
+	// uses poll(NULL, 0, timeout_ms) as a portable sleep, and retry-with-backoff loops rely on
+	// poll() actually taking `timeout` ms per iteration — returning 0 instantly would turn either
+	// pattern into an unthrottled busy-loop pegging the guest thread's host core.
+	auto sleep_for_timeout = [timeout]() {
+		if (timeout > 0) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+		}
+	};
+
+	if (fds == nullptr || nfds == 0) {
+		sleep_for_timeout();
+		return 0;
+	}
+
+	int ready = 0;
+	for (uint64_t i = 0; i < nfds; i++) {
+		fds[i].revents = static_cast<int16_t>(fds[i].events & (POSIX_POLLIN | POSIX_POLLOUT));
+		if (fds[i].revents != 0) {
+			ready++;
+		}
+	}
+
+	if (ready == 0) {
+		sleep_for_timeout();
+	}
+
+	return ready;
+}
+
 int64_t KYTY_SYSV_ABI send(int s, const void* buf, uint64_t len, int flags) {
 	PRINT_NAME();
 	return Network::Net::Send(s, buf, len, flags);
@@ -2090,11 +2403,13 @@ uint64_t KYTY_SYSV_ABI KernelSyncOnAddressV1(uint64_t op, uint64_t address, uint
 
 LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("k+AXqu2-eBc", getpagesize);
+	LIB_FUNC("mkawd0NA9ts", sysconf);
 	LIB_FUNC("lLMT9vJAck0", clock_gettime);
 	LIB_FUNC("smIj7eqzZE8", clock_getres);
 	LIB_FUNC("n88vx3C5nW8", gettimeofday);
 	LIB_FUNC("NhpspxdjEKU", nanosleep);
 	LIB_FUNC("yS8U2TGCe1A", nanosleep);
+	LIB_FUNC("0t0-MxQNwK4", raise);
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
@@ -2162,6 +2477,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("YQOfxL4QfeU", LibKernel::Memory::KernelMprotect);
 	LIB_FUNC("UqDGjXA5yUM", LibKernel::Memory::KernelMunmap);
 	LIB_FUNC("AqBioC2vF3I", LibKernel::read);
+	LIB_FUNC("aPcyptbOiZs", LibKernel::sigprocmask);
 	LIB_FUNC("TU-d9PfIHPM", Posix::socket);
 	LIB_FUNC("KuOmgKoqCdY", Posix::bind);
 	LIB_FUNC("XVL8So3QJUk", Posix::connect);
@@ -2171,6 +2487,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("6O8EwYOgH9Y", Posix::getsockopt);
 	LIB_FUNC("fFxGkxF2bVo", Posix::setsockopt);
 	LIB_FUNC("T8fER+tIGgk", Posix::select);
+	LIB_FUNC("ku7D4q1Y9PI", Posix::poll);
 	LIB_FUNC("fZOeZIOEmLw", Posix::send);
 	LIB_FUNC("oBr313PppNE", Posix::sendto);
 	LIB_FUNC("Ez8xjo9UF4E", Posix::recv);
@@ -3288,6 +3605,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("-ZR+hG7aDHw", LibKernel::KernelSleep);
 	LIB_FUNC("6c3rCVE-fTU", LibKernel::open);
 	LIB_FUNC("6xVpy0Fdq+I", LibKernel::sigprocmask);
+	LIB_FUNC("KiJEPEWRyUY", LibKernel::sigaction);
 	LIB_FUNC("6Z83sYWFlA8", LibKernel::exit);
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
@@ -3297,6 +3615,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);
 	LIB_FUNC("9BcDykPmo1I", LibKernel::get_error_addr);
 	LIB_FUNC("k+AXqu2-eBc", Posix::getpagesize);
+	LIB_FUNC("mkawd0NA9ts", Posix::sysconf);
 	LIB_FUNC("bnZxYgAFeA0", LibKernel::KernelGetSanitizerNewReplaceExternal);
 	LIB_FUNC("ca7v6Cxulzs", LibKernel::KernelSetGPO);
 	LIB_FUNC("4oXYe9Xmk0Q", LibKernel::KernelGetGPI);
@@ -3307,6 +3626,11 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("crb5j7mkk1c", LibKernel::KernelIsSignalReturn); // _is_signal_return
 	LIB_FUNC("Fjc4-n1+y2g", LibKernel::elf_phdr_match_addr);
 	LIB_FUNC("FxVZqBAA7ks", LibKernel::write);
+	LIB_FUNC("BPE9s9vQQXo", LibKernel::mmap);
+	LIB_FUNC("YSHRBRLn2pI", LibKernel::writev); // _writev
+	LIB_FUNC("Z2aKdxzS4KE", LibKernel::writev); // writev (sibling NID, same function)
+	LIB_FUNC("wW+k21cmbwQ", LibKernel::ioctl);  // _ioctl
+	LIB_FUNC("PfccT7qURYE", LibKernel::ioctl);  // ioctl (sibling NID, same function)
 	LIB_FUNC("FJmglmTMdr4", LibKernel::getargv);
 	LIB_FUNC("kbw4UHHSYy0", LibKernel::pthread_cxa_finalize);
 	LIB_FUNC("lLMT9vJAck0", LibKernel::clock_gettime);
