@@ -1018,10 +1018,116 @@ KYTY_SUBSYSTEM_INIT(Memory) {
 	g_flexible_memory           = new FlexibleMemory;
 	g_pooled_memory             = new PooledMemory;
 	g_virtual_ranges            = new VirtualRanges;
+
+	VirtualMemory::Init();
+
+#if defined(__APPLE__)
+	// Under Rosetta 2 on Apple Silicon, macOS lacks MAP_FIXED_NOREPLACE, so
+	// ReserveFixedHostRange()/SysVirtualReserveFixed() are check-then-act: they probe with
+	// is_mapped() and then mmap(MAP_FIXED), which can lose the race to whatever else maps into
+	// the same address in between (is_mapped() queries the real Mach VM map, so a losing race
+	// just fails the reservation rather than corrupting the other mapping -- but a fatal,
+	// unrecoverable failure is exactly what ReserveFixedHostRange()'s per-page fallback does on a
+	// partial reservation it can no longer roll back). A real title (PPSA21564) has been observed
+	// dying exactly this way: libc.prx's "orbis_user_malloc" heap calls
+	// sceKernelMapNamedDirectMemory() for the fixed range [0x300000000, 0x379800000), and by the
+	// time that call lands, some host allocator has already claimed page 0x307150000 inside it.
+	//
+	// The single biggest source of that collision turned out to be *this very subsystem*: the
+	// direct-memory backing created a few lines below (DirectMemoryBacking's constructor, see
+	// memoryAddressSpace.inc) mmaps a shared-memory file sized to the whole simulated PS5 RAM
+	// (~13.5 GiB on this build) with no address hint at all, and the kernel was observed placing
+	// it starting at ~12.24 GiB -- squarely inside this exact heap range, eating essentially all
+	// of it. Reserving the guest's fixed ranges *before* that backing is created forces the
+	// kernel to place the hint-less backing mapping somewhere else instead, which is why this
+	// block now runs ahead of `new DirectMemoryBacking(...)` rather than after it.
+	//
+	// Claim the *specific* fixed ranges the guest is known to need here, as PROT_NONE/
+	// MAP_NORESERVE, before any module (and therefore any game code) has loaded and before this
+	// subsystem's own backing allocation can compete for the same pages. Once a page belongs to
+	// this process, a later fixed guest mapping just replaces our own placeholder in place (no
+	// hole is ever exposed to a competing mmap) instead of racing a lazy allocator for it.
+	//
+	// This intentionally does NOT reserve the whole [8 GiB, 63 GiB) guest band: an earlier
+	// version of this fix did, and it broke the very first homebrew boot -- CreateGuestStack()
+	// (kernel/pthread.cpp) allocates the guest's own main-thread stack via a *non-fixed* search
+	// starting at DEFAULT_PS5_BASE (8 GiB, see KernelMapNamedFlexibleMemory), and with the whole
+	// band pre-claimed as our own PROT_NONE placeholder that search has nowhere left to land,
+	// aborting with EXIT_NOT_IMPLEMENTED. Fixed-address consumers can replace our placeholder in
+	// place, but non-fixed search allocators just see the range as occupied and fail. So only the
+	// two ranges actually requested by fixed-address guest code are claimed, leaving the rest of
+	// the band free for the guest's own dynamic allocations (thread stacks, flexible memory):
+	//   - the direct-memory heap libc.prx maps by name ("orbis_user_malloc") at a fixed 12 GiB
+	//   - the module code base (SYSTEM_RESERVED + CODE_BASE_OFFSET = 36 GiB, see
+	//     runtimeLinker.cpp), with headroom for multiple modules (CODE_BASE_INCR = 256 MiB each)
+	// Both stay well below the Rosetta commpage carveout (0xFC0000000-0xFFFFFFFFF, ~63-64 GiB)
+	// and the GPU/Metal carveout above it (0x1000000000-0x6FFFFFFFFF, 64-448 GiB), which must
+	// never be mmap'd by guest code.
+	//
+	// A single whole-range reservation can still fail in practice: a permanent host artifact can
+	// already sit inside a requested range before Memory::Init() ever runs -- e.g. the
+	// *primordial thread's own stack* (set up by the kernel before main() executes, so no
+	// init-order change can dodge it) has been observed landing at ~12 GiB, inside the heap
+	// range, on this host. That is permanent for the life of the process, not a race we can win.
+	// So reserve each range in chunks and skip whatever chunk is already occupied instead of
+	// giving up on the whole range for one obstacle: this still claims the vast majority of the
+	// range and leaves a gap only exactly where a real, permanent host mapping already lives.
+	constexpr uint64_t RESERVE_CHUNK_SIZE = 0x400000ull; // 4 MiB: fine-grained enough to route
+	                                                     // around small permanent obstacles
+	                                                     // without one syscall per 16K guest page
+
+	constexpr uint64_t HEAP_RESERVED_MIN = 0x300000000ull; // 12 GiB: observed "orbis_user_malloc"
+	                                                       // sceKernelMapNamedDirectMemory() start
+	constexpr uint64_t HEAP_RESERVED_MAX = 0x379800000ull; // ~13.95 GiB: observed end of that range
+	constexpr uint64_t CODE_RESERVED_MIN = 0x900000000ull; // 36 GiB: SYSTEM_RESERVED +
+	                                                       // CODE_BASE_OFFSET (runtimeLinker.cpp)
+	constexpr uint64_t CODE_RESERVED_MAX = 0xb00000000ull; // 44 GiB: 8 GiB headroom for multiple
+	                                                       // modules (32x CODE_BASE_INCR)
+
+	auto reserve_range_best_effort = [RESERVE_CHUNK_SIZE](uint64_t range_min, uint64_t range_max,
+	                                                      const char* label) {
+		const uint64_t total = range_max - range_min;
+		uint64_t       reserved = 0;
+		uint64_t       skipped  = 0;
+		if (VirtualMemory::ReserveFixed(range_min, total)) {
+			reserved = total;
+		} else {
+			for (uint64_t addr = range_min; addr < range_max; addr += RESERVE_CHUNK_SIZE) {
+				const uint64_t chunk_size =
+				    std::min<uint64_t>(RESERVE_CHUNK_SIZE, range_max - addr);
+				if (VirtualMemory::ReserveFixed(addr, chunk_size)) {
+					reserved += chunk_size;
+				} else {
+					skipped += chunk_size;
+				}
+			}
+		}
+
+		if (skipped == 0) {
+			LOGF_COLOR(Log::Color::Green,
+			           "\t early guest address-space reservation (%s): start=0x%016" PRIx64
+			           " size=0x%016" PRIx64 " ok\n",
+			           label, range_min, total);
+		} else {
+			// Best-effort: some chunks overlap a pre-existing host mapping.
+			// ReserveFixedHostRange()'s existing per-page fallback remains the safety net when
+			// the guest actually asks for a fixed address later, so just report coverage and
+			// continue.
+			LOGF_COLOR(Log::Color::Yellow,
+			           "\t early guest address-space reservation (%s): start=0x%016" PRIx64
+			           " total=0x%016" PRIx64 " reserved=0x%016" PRIx64 " skipped=0x%016" PRIx64
+			           " (partial, continuing best-effort)\n",
+			           label, range_min, total, reserved, skipped);
+		}
+	};
+
+	reserve_range_best_effort(HEAP_RESERVED_MIN, HEAP_RESERVED_MAX, "heap");
+	reserve_range_best_effort(CODE_RESERVED_MIN, CODE_RESERVED_MAX, "code");
+#endif
+
 	g_direct_memory_backing     = new DirectMemoryBacking(PhysicalMemory::Size());
 	g_placeholder_address_space = new PlaceholderAddressSpace;
 
-	VirtualMemory::Init();
 	EXIT_IF(!g_direct_memory_backing->SelfTest());
 	g_placeholder_address_space->SelfTest();
 	SelfTestSub64SharedPlaceholderAlias();
@@ -3014,7 +3120,9 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size) {
 			if (info.State == MEM_COMMIT) {
 				if (!VirtualMemory::Decommit(addr, PAGE_SIZE)) {
 					if (host_mutated) {
-						EXIT("reserve-fixed partial host decommit cannot be rolled back safely\n");
+						EXIT("reserve-fixed partial host decommit cannot be rolled back safely: "
+						     "start=0x%016" PRIx64 " size=0x%016" PRIx64 " failed_page=0x%016" PRIx64 "\n",
+						     start, size, addr);
 					}
 					LOGF_COLOR(Log::Color::Red,
 					           "\t reserve-fixed replace: decommit failed at 0x%016" PRIx64 "\n",
@@ -3031,7 +3139,13 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size) {
 #endif
 		if (!VirtualMemory::ReserveFixed(addr, PAGE_SIZE)) {
 			if (host_mutated) {
-				EXIT("reserve-fixed partial host reservation cannot be rolled back safely\n");
+				LOGF_COLOR(Log::Color::Red,
+				           "\t reserve-fixed replace: partial reservation cannot be rolled back safely: "
+				           "start=0x%016" PRIx64 " size=0x%016" PRIx64 " failed_page=0x%016" PRIx64 "\n",
+				           start, size, addr);
+				EXIT("reserve-fixed partial host reservation cannot be rolled back safely: "
+				     "start=0x%016" PRIx64 " size=0x%016" PRIx64 " failed_page=0x%016" PRIx64 "\n",
+				     start, size, addr);
 			}
 			LOGF_COLOR(Log::Color::Red,
 			           "\t reserve-fixed replace: reserve failed at 0x%016" PRIx64 "\n", addr);
