@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <fmt/format.h>
+#include <pthread.h>
 
 using namespace Common;
 using namespace Emulator;
@@ -244,6 +245,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 int main(int argc, char* argv[]) {
+	fprintf(stderr, "[stack-probe] main stack top ~%p, local ~%p\n",
+	        pthread_get_stackaddr_np(pthread_self()), (void*)&argc);
+	fflush(stderr);
+
 	auto& slist = *SubsystemsList::Instance();
 
 	slist.SetArgs(argc, argv);

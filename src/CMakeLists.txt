@@ -502,6 +502,15 @@ if(KYTY_CLANG_CL)
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
+elseif(APPLE)
+	# Experiment: under Rosetta 2, the primordial thread's stack address tracks
+	# __PAGEZERO size as (pagezero + ~8.15 GiB) rather than a fixed 3x multiple,
+	# up to a ceiling around 12-12.2 GiB where it clamps back down (the exact
+	# zone the guest's fixed orbis_user_malloc heap occupies: [0x300000000,
+	# 0x379800000)). A 2 GiB __PAGEZERO keeps the stack at ~10.18 GiB, safely
+	# below that heap range with margin to spare, while still generously
+	# covering realistic NULL+offset null-deref bugs.
+	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "-Wl,-pagezero_size,0x80000000")
 endif()
 
 add_dependencies(kyty_emulator KytyGitVersion)
