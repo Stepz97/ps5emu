@@ -539,7 +539,8 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	    attribute.pitch_in_pixel != 0 ||
 	    (attribute.option != 0 &&
 	     attribute.option != VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY) ||
-	    attribute.tiling_mode != 0 || attribute.pad0 != 0 || attribute.reserved1[0] != 0 ||
+	    (attribute.tiling_mode != 0 && attribute.tiling_mode != 1) || attribute.pad0 != 0 ||
+	    attribute.reserved1[0] != 0 ||
 	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0 || buffer.data_address == 0 ||
 	    compression == Graphics::VideoOutCompression::Unsupported) {
 		EXIT("unsupported or invalid video-out surface attributes\n");
@@ -548,14 +549,16 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
 		EXIT("unsupported video-out pixel format: 0x%016" PRIx64 "\n", attribute.pixel_format);
 	}
-	const auto tile_mode =
-	    Graphics::Prospero::GpuEnumValue(Graphics::Prospero::TileMode::kRenderTarget);
+	const auto tile_mode = Graphics::Prospero::GpuEnumValue(
+	    attribute.tiling_mode == 1 ? Graphics::Prospero::TileMode::kLinear
+	                               : Graphics::Prospero::TileMode::kRenderTarget);
 	const auto pitch =
 	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, 1, tile_mode);
 	Graphics::TileSizeAlign total {};
 	Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width, attribute.height,
 	                                  1, pitch, 1, tile_mode, false, total);
-	if (total.size == 0 || total.align != 65536 ||
+	const uint32_t expected_align = attribute.tiling_mode == 1 ? 256u : 65536u;
+	if (total.size == 0 || total.align != expected_align ||
 	    (buffer.data_address & (total.align - 1u)) != 0) {
 		EXIT("invalid video-out surface footprint or alignment\n");
 	}
@@ -583,6 +586,55 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 		EXIT("unsupported normalized video-out format\n");
 	}
 	return info;
+}
+
+// Diagnostic instrumentation: dumps the raw guest scan-out buffer to a PPM file the first
+// time a non-special flip is prepared, so its byte layout can be inspected outside the
+// Metal/MoltenVK swapchain (screencapture cannot capture the CAMetalLayer contents).
+// Gated behind --dump-scanout <path>; a no-op when the configured path is empty.
+static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
+	const auto path = Config::GetDumpScanOutPath();
+	if (path.empty()) {
+		return;
+	}
+
+	static bool dumped = false;
+	if (dumped) {
+		return;
+	}
+	dumped = true;
+
+	if (info.data.address == 0 || info.extent.width == 0 || info.extent.height == 0 ||
+	    info.bytes_per_block < 3) {
+		return;
+	}
+
+	const auto* base        = reinterpret_cast<const uint8_t*>(info.data.address);
+	const auto  width       = info.extent.width;
+	const auto  height      = info.extent.height;
+	const auto  pitch_bytes = static_cast<uint64_t>(info.pitch) * info.bytes_per_block;
+
+	FILE* file = fopen(path.c_str(), "wb");
+	if (file == nullptr) {
+		LOGF("failed to open %s for scan-out dump\n", path.c_str());
+		return;
+	}
+
+	fprintf(file, "P6\n%u %u\n255\n", width, height);
+
+	for (uint32_t row = 0; row < height; row++) {
+		const uint8_t* row_ptr = base + static_cast<uint64_t>(row) * pitch_bytes;
+		for (uint32_t col = 0; col < width; col++) {
+			// Raw bytes exactly as stored in the guest buffer, no channel reordering,
+			// so the real byte order can be diagnosed from the dump itself.
+			fwrite(row_ptr + static_cast<uint64_t>(col) * info.bytes_per_block, 1, 3, file);
+		}
+	}
+
+	fclose(file);
+
+	LOGF("dumped scan-out frame to %s (%ux%u pitch=%" PRIu64 ")\n", path.c_str(), width, height,
+	     pitch_bytes);
 }
 
 VideoOutDriver::VideoOutDriver(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
@@ -996,6 +1048,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 					     request_id, index, surface.group_index);
 				}
 				source_info = cfg->groups[surface.group_index].ImageInfo(surface);
+				DumpScanOutFrameOnce(source_info);
 			}
 		}
 	}
@@ -1449,13 +1502,12 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers(int handle, int buffer_index_start,
 	     attribute->tiling_mode, attribute->aspect_ratio, attribute->width, attribute->height,
 	     attribute->pitch_in_pixel);
 
-	// tiling_mode/pitch_in_pixel are not forwarded: VideoOutSetBufferAttribute2 forces the
-	// internal attribute's equivalent fields to 0, which is a hard requirement further down
-	// (ImageInfo() rejects anything else) — video-out buffers always use a single, fixed
-	// internal tiling regardless of what the PS4 title requested.
+	// tiling_mode is forwarded as-is (ImageInfo() accepts TILE=0 and LINEAR=1); pitch_in_pixel
+	// stays fixed at 0 since this legacy v1 attribute never carries an explicit pitch.
 	VideoOutBufferAttribute2 attribute2 {};
 	VideoOutSetBufferAttribute2(&attribute2, ExpandLegacyPixelFormat(static_cast<uint32_t>(attribute->format)),
-	                            0, attribute->width, attribute->height, 0, 0, 0);
+	                            static_cast<uint32_t>(attribute->tiling_mode), attribute->width,
+	                            attribute->height, 0, 0, 0);
 
 	std::vector<VideoOutBuffers> buffers(static_cast<size_t>(buffer_num));
 	for (int i = 0; i < buffer_num; i++) {

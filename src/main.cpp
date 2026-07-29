@@ -55,6 +55,8 @@ static void PrintUsage() {
 	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
+	::printf("  --dump-scanout <path>                Dump the first scan-out frame to a PPM "
+	         "file at this path.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
@@ -203,6 +205,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--dump-scanout") {
+			options.config.dump_scanout_path = value;
 		} else if (arg == "--printf-direction") {
 			if (!ParseEnum(value, options.config.printf_direction)) {
 				::printf("invalid printf direction: %s\n", value.c_str());
