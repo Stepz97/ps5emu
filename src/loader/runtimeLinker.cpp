@@ -784,6 +784,20 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			     info->access_violation_vaddr);
 		}();
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			// Rosetta aborts internally when a wide unaligned store splits across a page
+			// boundary into a watched page (muro 18); sample the faults this rip resolves
+			// fine so the destination buffer of the crash site is known from the log.
+			static std::atomic_uint64_t g_sampled_faults {0};
+			if (info->exception_address == 0xb0737d123ull) {
+				const auto count = g_sampled_faults.fetch_add(1, std::memory_order_relaxed);
+				if (count < 8 || (count & 0x3ffu) == 0) {
+					fprintf(stderr,
+					        "gpu-fault-sample: rip=0x%016" PRIx64 " vaddr=0x%016" PRIx64
+					        " access=%u count=%" PRIu64 "\n",
+					        info->exception_address, info->access_violation_vaddr,
+					        static_cast<uint32_t>(access), count + 1);
+				}
+			}
 			return true;
 		}
 
