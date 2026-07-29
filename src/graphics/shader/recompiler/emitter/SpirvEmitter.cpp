@@ -158,10 +158,11 @@ bool ValidateInstructionContract(const IR::Instruction& inst, std::string* error
 	                           inst.dst.kind != IR::OperandKind::Register)) ||
 	    (IsDsWrite(inst.op) && (!ds_kind || !ds_resource || inst.src_count != 2 ||
 	                            inst.dst.kind != IR::OperandKind::Null)) ||
+	    // GDS append/consume accepts a nonzero instruction offset: EmitAppendConsumeAddress adds
+	    // memory.offset to the M0[31:16] base and bounds-checks it against M0[15:0].
 	    ((inst.op == IR::Opcode::DsAppend || inst.op == IR::Opcode::DsConsume) &&
 	     (!ds_kind || !ds_resource || inst.src_count != 1 ||
-	      inst.dst.kind != IR::OperandKind::Register ||
-	      (kind == IR::ResourceKind::Gds && inst.memory.offset != 0))) ||
+	      inst.dst.kind != IR::OperandKind::Register)) ||
 	    ((inst.op == IR::Opcode::DsMinF32 || inst.op == IR::Opcode::DsMaxF32) &&
 	     (!ds_kind || !ds_resource || inst.src_count != 3 ||
 	      inst.dst.kind != IR::OperandKind::Null)) ||

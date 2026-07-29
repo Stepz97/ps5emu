@@ -442,11 +442,10 @@ bool DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	     inst.opcode == Opcode::DsReadAddtidB32)) {
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle/addtid is available only for LDS");
 	}
-	if (inst.gds && (inst.opcode == Opcode::DsAppend || inst.opcode == Opcode::DsConsume) &&
-	    inst.offset != 0u) {
-		SetUnsupported(inst, Family::DS, opcode,
-		               "GDS append/consume requires a zero instruction offset");
-	}
+	// GDS append/consume with a nonzero instruction offset addresses the counter at
+	// M0[31:16] + offset; the whole pipeline (MemoryInfoFromDecoded -> EmitAppendConsumeAddress)
+	// already adds memory.offset to the M0 base and bounds-checks it against M0[15:0], so no
+	// decoder restriction is needed (real titles allocate counters at nonzero GDS offsets).
 	if (inst.opcode == Opcode::DsWriteAddtidB32 && data1 != 0u) {
 		SetUnsupported(inst, Family::DS, opcode,
 		               "DS write addtid data1 operand is not implemented");
