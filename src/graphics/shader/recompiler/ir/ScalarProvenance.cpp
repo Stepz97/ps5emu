@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <compare>
+#include <cstdio>
 #include <deque>
 #include <fmt/format.h>
 #include <map>
@@ -229,17 +231,62 @@ public:
 			}
 		}
 		Queue(0);
+		// Convergence guard: a healthy pass revisits each block about loop-depth times, so the
+		// worklist should drain in roughly block_count * depth iterations. A transfer function
+		// that keeps minting fresh values never stabilizes and would spin here forever (seen
+		// with a 407-block, 8-loop fluid-sim CS from a real title); fail with enough forensic
+		// context to identify the diverging block and the values it keeps creating.
+		uint64_t              iterations    = 0;
+		const uint64_t        iteration_cap = static_cast<uint64_t>(block_count) * 100u;
+		std::vector<uint32_t> visits(block_count, 0);
 		while (!m_work.empty()) {
 			const auto block_index = m_work.front();
 			m_work.pop_front();
 			m_queued[block_index] = false;
 
+			iterations++;
+			visits[block_index]++;
+			if ((iterations % 10000u) == 0) {
+				fprintf(stderr,
+				        "scalar-provenance: %" PRIu64 " iterations, work=%zu, values=%zu\n",
+				        iterations, m_work.size(), m_graph.values.size());
+			}
+			if (iterations > iteration_cap) {
+				uint32_t top_block = 0;
+				for (uint32_t block = 0; block < block_count; block++) {
+					if (visits[block] > visits[top_block]) {
+						top_block = block;
+					}
+				}
+				std::string tail;
+				const auto  value_count = m_graph.values.size();
+				for (auto i = (value_count > 8 ? value_count - 8 : 0); i < value_count; i++) {
+					tail += fmt::format(" [{}]={}", i,
+					                    ScalarValueToString(m_graph, static_cast<uint32_t>(i)));
+				}
+				return Fail(error,
+				            fmt::format("scalar provenance did not converge after {} iterations "
+				                        "(blocks={}, values={}, top_block={} visits={}, tail:{})",
+				                        iterations, block_count, value_count, top_block,
+				                        visits[top_block], tail));
+			}
+
+			const bool forensic = (iterations + 32 > iteration_cap);
+
 			auto       next_entry    = MergeEntry(block_index);
 			const bool entry_changed = next_entry != m_entry[block_index];
-			m_entry[block_index]     = next_entry;
+			if (forensic && entry_changed) {
+				fprintf(stderr, "sp-osc: it=%" PRIu64 " block=%u entry %s\n", iterations,
+				        block_index, DiffScalarStates(m_entry[block_index], next_entry).c_str());
+			}
+			m_entry[block_index] = next_entry;
 
 			auto       next_exit = Execute(m_program.blocks[block_index], next_entry, false);
 			const bool was_ready = m_exit_ready[block_index];
+			if (forensic && was_ready && !(next_exit == m_exit[block_index])) {
+				fprintf(stderr, "sp-osc: it=%" PRIu64 " block=%u exit %s\n", iterations,
+				        block_index, DiffScalarStates(m_exit[block_index], next_exit).c_str());
+			}
 			if (was_ready && !entry_changed && next_exit == m_exit[block_index]) {
 				continue;
 			}
@@ -784,12 +831,19 @@ private:
 			if (incoming.empty()) {
 				return ScalarProvenance::Undefined;
 			}
+			// Sticky phi: once this slot needed a phi, keep resolving to that same phi and only
+			// refresh its arguments. Re-deciding between the phi and a plain value each round
+			// makes the merge non-monotonic: two self-referential loop-head phis for the same
+			// loop-invariant value can then chase each other around the cycle forever (seen as a
+			// period-2 oscillation, sreg flipping phiA<->phiB, in a 407-block fluid-sim CS).
+			if (*phi != ScalarProvenance::Undefined) {
+				m_graph.values[*phi].phi_args = std::move(incoming);
+				return *phi;
+			}
 			if (incoming.size() == 1) {
 				return incoming[0];
 			}
-			if (*phi == ScalarProvenance::Undefined) {
-				*phi = AddValue({ScalarValueOp::Phi, block.start_pc});
-			}
+			*phi                          = AddValue({ScalarValueOp::Phi, block.start_pc});
 			m_graph.values[*phi].phi_args = std::move(incoming);
 			return *phi;
 		};
@@ -846,6 +900,59 @@ private:
 			m_queued[block] = true;
 			m_work.push_back(block);
 		}
+	}
+
+	std::string DescribeValue(uint32_t id) const {
+		auto text = ScalarValueToString(m_graph, id);
+		if (id < m_graph.values.size() && m_graph.values[id].op == ScalarValueOp::Phi) {
+			text += "(";
+			for (const auto arg: m_graph.values[id].phi_args) {
+				text += fmt::format("{},", arg);
+			}
+			text += ")";
+		}
+		return text;
+	}
+
+	// First differing slot between two states, for the non-convergence forensics.
+	std::string DiffScalarStates(const ScalarState& previous, const ScalarState& next) const {
+		for (uint32_t reg = 0; reg < ScalarRegisters; reg++) {
+			if (previous.regs[reg] != next.regs[reg]) {
+				return fmt::format("sreg{}: {} -> {}", reg, DescribeValue(previous.regs[reg]),
+				                   DescribeValue(next.regs[reg]));
+			}
+		}
+		for (uint32_t reg = 0; reg < VectorRegisters; reg++) {
+			if (previous.address_bases[reg] != next.address_bases[reg]) {
+				return fmt::format("vbase{}: {} -> {}", reg,
+				                   DescribeValue(previous.address_bases[reg]),
+				                   DescribeValue(next.address_bases[reg]));
+			}
+		}
+		if (previous.scc != next.scc) {
+			return fmt::format("scc: {} -> {}", DescribeValue(previous.scc),
+			                   DescribeValue(next.scc));
+		}
+		if (previous.m0 != next.m0) {
+			return fmt::format("m0: {} -> {}", DescribeValue(previous.m0),
+			                   DescribeValue(next.m0));
+		}
+		for (const auto& [lane, value]: next.vector_lanes) {
+			const auto found = previous.vector_lanes.find(lane);
+			if (found == previous.vector_lanes.end()) {
+				return fmt::format("lane 0x{:x}: (absent) -> {}", lane, DescribeValue(value));
+			}
+			if (found->second != value) {
+				return fmt::format("lane 0x{:x}: {} -> {}", lane, DescribeValue(found->second),
+				                   DescribeValue(value));
+			}
+		}
+		for (const auto& [lane, value]: previous.vector_lanes) {
+			if (next.vector_lanes.find(lane) == next.vector_lanes.end()) {
+				return fmt::format("lane 0x{:x}: {} -> (absent)", lane, DescribeValue(value));
+			}
+		}
+		return "equal";
 	}
 
 	Program&                          m_program;
