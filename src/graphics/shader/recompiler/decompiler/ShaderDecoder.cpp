@@ -436,6 +436,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SBcnt1I32B32: return "s_bcnt1_i32_b32";
 		case Opcode::SBcnt1I32B64: return "s_bcnt1_i32_b64";
 		case Opcode::SFf1I32B32: return "s_ff1_i32_b32";
+		case Opcode::SFf1I32B64: return "s_ff1_i32_b64";
 		case Opcode::SFlbitI32B64: return "s_flbit_i32_b64";
 		case Opcode::SBitreplicateB64B32: return "s_bitreplicate_b64_b32";
 		case Opcode::SGetpcB64: return "s_getpc_b64";
@@ -659,6 +660,8 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VMadMixhiF16: return "v_mad_mixhi_f16";
 		case Opcode::VAddNcU32: return "v_add_nc_u32";
 		case Opcode::VAddcU32: return "v_addc_u32";
+		case Opcode::VSubbU32: return "v_subb_u32";
+		case Opcode::VSubbrevU32: return "v_subbrev_u32";
 		case Opcode::VSubNcU32: return "v_sub_nc_u32";
 		case Opcode::VSubrevNcU32: return "v_subrev_nc_u32";
 		case Opcode::VAddNcU16: return "v_add_nc_u16";
@@ -767,6 +770,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VCmpGeU32: return "v_cmp_ge_u32";
 		case Opcode::VCmpTU32: return "v_cmp_t_u32";
 		case Opcode::VCmpNeU64: return "v_cmp_ne_u64";
+		case Opcode::VCmpGtU64: return "v_cmp_gt_u64";
 		case Opcode::VCmpxLtU32: return "v_cmpx_lt_u32";
 		case Opcode::VCmpxEqU32: return "v_cmpx_eq_u32";
 		case Opcode::VCmpxLeU32: return "v_cmpx_le_u32";
@@ -886,6 +890,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::DsReadAddtidB32: return "ds_read_addtid_b32";
 		case Opcode::ImageGetResinfo: return "image_get_resinfo";
 		case Opcode::ImageGetLod: return "image_get_lod";
+		case Opcode::ImageBvhIntersectRay: return "image_bvh_intersect_ray";
 		case Opcode::ImageLoad: return "image_load";
 		case Opcode::ImageLoadMip: return "image_load_mip";
 		case Opcode::ImageStore: return "image_store";
@@ -995,6 +1000,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::SBrevB32:
 		case Opcode::SBcnt1I32B32:
 		case Opcode::SFf1I32B32:
+		case Opcode::SFf1I32B64:
 		case Opcode::SNotB64:
 		case Opcode::SWqmB64:
 		case Opcode::SAndSaveexecB32:

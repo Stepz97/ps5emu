@@ -314,6 +314,25 @@ bool LowerDsReadAddtidB32(const Decoder::Instruction& decoded, BasicBlock& block
 	return true;
 }
 
+// Placeholder for RDNA2 hardware ray tracing: image_bvh_intersect_ray is lowered to a stub
+// that returns the miss sentinel (0xFFFFFFFF, the invalid-node pointer; NaN when read as the
+// intersection t) in every result component, so guest BVH traversal loops terminate with "no
+// hit". Sources and the BVH descriptor are ignored - MoltenVK exposes no ray-query path, and a
+// software traversal of the RDNA2 BVH node format is future work.
+bool LowerImageBvhIntersectRayMiss(const Decoder::Instruction& decoded, BasicBlock& block,
+                                   std::string* error) {
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = Opcode::ImageBvhIntersectRay;
+	inst.src_count = 0;
+	inst.memory    = MemoryInfoFromDecoded(decoded, ResourceKind::None);
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
 bool LowerDsAppendConsume(const Decoder::Instruction& decoded, BasicBlock& block, Opcode op,
                           std::string* error) {
 	Instruction inst;
@@ -653,6 +672,8 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 		case Decoder::Opcode::DsWriteB64:
 		case Decoder::Opcode::DsWriteB96:
 		case Decoder::Opcode::DsWriteB128: return LowerDsWrite(decoded, block, error);
+		case Decoder::Opcode::ImageBvhIntersectRay:
+			return LowerImageBvhIntersectRayMiss(decoded, block, error);
 		case Decoder::Opcode::ImageGetResinfo:
 		case Decoder::Opcode::ImageGetLod:
 		case Decoder::Opcode::ImageLoad:
@@ -790,6 +811,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::DsWriteB128:
 		case Decoder::Opcode::DsWriteAddtidB32:
 		case Decoder::Opcode::DsReadAddtidB32:
+		case Decoder::Opcode::ImageBvhIntersectRay:
 		case Decoder::Opcode::ImageGetResinfo:
 		case Decoder::Opcode::ImageGetLod:
 		case Decoder::Opcode::ImageLoad:

@@ -1140,6 +1140,8 @@ void EmitFindMsbFromHighU64(EmitterState& state, const IR::Instruction& inst);
 
 void EmitBitCountU64(EmitterState& state, const IR::Instruction& inst);
 
+void EmitFindLsbU64(EmitterState& state, const IR::Instruction& inst);
+
 void EmitBitCountU32(EmitterState& state, const IR::Instruction& inst);
 
 void EmitBitCountAddU32(EmitterState& state, const IR::Instruction& inst);
@@ -1349,6 +1351,10 @@ void EmitCompareI16(EmitterState& state, const IR::Instruction& inst, uint32_t o
 void EmitBitCompareB32(EmitterState& state, const IR::Instruction& inst, bool bit_set);
 
 void EmitCompareNeU64(EmitterState& state, const IR::Instruction& inst);
+
+void EmitCompareGtU64(EmitterState& state, const IR::Instruction& inst);
+
+void EmitImageBvhIntersectRayMiss(EmitterState& state, const IR::Instruction& inst);
 
 void EmitCompareConstant(EmitterState& state, const IR::Instruction& inst, bool value);
 

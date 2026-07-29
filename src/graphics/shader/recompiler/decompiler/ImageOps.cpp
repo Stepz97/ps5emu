@@ -246,6 +246,7 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::ImageStoreMip;
 		case 0x0eu: return Opcode::ImageGetResinfo;
 		case 0x60u: return Opcode::ImageGetLod;
+		case 0xe6u: return Opcode::ImageBvhIntersectRay;
 		default: return Opcode::Unsupported;
 	}
 }

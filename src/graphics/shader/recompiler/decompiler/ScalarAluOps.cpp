@@ -39,6 +39,7 @@ constexpr OpcodeMap SOP1_OPS[] = {
     {0x0fu, Opcode::SBcnt1I32B32},
     {0x10u, Opcode::SBcnt1I32B64},
     {0x13u, Opcode::SFf1I32B32},
+    {0x14u, Opcode::SFf1I32B64},
     {0x16u, Opcode::SFlbitI32B64},
     {0x1bu, Opcode::SBitset0B32},
     {0x1du, Opcode::SBitset1B32},
@@ -77,6 +78,8 @@ constexpr OpcodeMap SOPP_OPS[] = {
     {0x07u, Opcode::SCbranchVccnz}, {0x08u, Opcode::SCbranchExecz}, {0x09u, Opcode::SCbranchExecnz},
     {0x0au, Opcode::SBarrier},      {0x0cu, Opcode::SWaitcnt},      {0x0eu, Opcode::SSleep},
     {0x10u, Opcode::SSendmsg},      {0x16u, Opcode::STtraceData},   {0x20u, Opcode::SInstPrefetch},
+    // s_trap (0x12) is the dead assert path in shipped shaders; fall through as a nop.
+    {0x12u, Opcode::SNop},
 };
 
 Opcode Lookup(const OpcodeMap* ops, uint32_t count, uint32_t opcode) {

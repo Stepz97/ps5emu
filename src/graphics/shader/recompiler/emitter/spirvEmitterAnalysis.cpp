@@ -207,10 +207,11 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>& 
 					CollectSequentialRegisters(registers, inst.src[i], 2);
 				}
 			}
-			if (inst.op == IR::Opcode::BitCountU64 || inst.op == IR::Opcode::FindMsbFromHighU64) {
+			if (inst.op == IR::Opcode::BitCountU64 || inst.op == IR::Opcode::FindMsbFromHighU64 ||
+			    inst.op == IR::Opcode::FindLsbU64) {
 				CollectSequentialRegisters(registers, inst.src[0], 2);
 			}
-			if (inst.op == IR::Opcode::CompareNeU64) {
+			if (inst.op == IR::Opcode::CompareNeU64 || inst.op == IR::Opcode::CompareGtU64) {
 				CollectSequentialRegisters(registers, inst.src[0], 2);
 				CollectSequentialRegisters(registers, inst.src[1], 2);
 			}
@@ -245,6 +246,9 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>& 
 				CollectSequentialRegisters(registers, inst.dst, inst.memory.data_dwords);
 				CollectSequentialRegisters(registers, inst.src[0],
 				                           inst.memory.image_address_components);
+			}
+			if (inst.op == IR::Opcode::ImageBvhIntersectRay) {
+				CollectSequentialRegisters(registers, inst.dst, inst.memory.data_dwords);
 			}
 			if (inst.op == IR::Opcode::ImageStore) {
 				CollectSequentialRegisters(registers, inst.src[0], inst.memory.data_dwords);
@@ -416,6 +420,7 @@ bool IsCompareOpcode(IR::Opcode op) {
 		case IR::Opcode::CompareLtU32:
 		case IR::Opcode::CompareLeU32:
 		case IR::Opcode::CompareNeU64:
+		case IR::Opcode::CompareGtU64:
 		case IR::Opcode::CompareMaskEqU32:
 		case IR::Opcode::CompareMaskNeU32:
 		case IR::Opcode::CompareMaskGtU32:

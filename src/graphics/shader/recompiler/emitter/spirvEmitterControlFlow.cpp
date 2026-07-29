@@ -454,6 +454,7 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::BitReverseU32: EmitUnaryU32(state, inst, OpBitReverse); break;
 		case IR::Opcode::BitCountU32: EmitBitCountU32(state, inst); break;
 		case IR::Opcode::BitCountU64: EmitBitCountU64(state, inst); break;
+		case IR::Opcode::FindLsbU64: EmitFindLsbU64(state, inst); break;
 		case IR::Opcode::BitCountAddU32: EmitBitCountAddU32(state, inst); break;
 		case IR::Opcode::MaskedBitCountLowU32: EmitMaskedBitCountU32(state, inst, 0); break;
 		case IR::Opcode::MaskedBitCountHighU32: EmitMaskedBitCountU32(state, inst, 1); break;
@@ -517,6 +518,8 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::CompareLtU32: EmitCompareU32(state, inst, OpULessThan); break;
 		case IR::Opcode::CompareLeU32: EmitCompareU32(state, inst, OpULessThanEqual); break;
 		case IR::Opcode::CompareNeU64: EmitCompareNeU64(state, inst); break;
+		case IR::Opcode::CompareGtU64: EmitCompareGtU64(state, inst); break;
+		case IR::Opcode::ImageBvhIntersectRay: EmitImageBvhIntersectRayMiss(state, inst); break;
 		case IR::Opcode::CompareMaskEqU32: EmitCompareMaskU32(state, inst, OpIEqual); break;
 		case IR::Opcode::CompareMaskNeU32: EmitCompareMaskU32(state, inst, OpINotEqual); break;
 		case IR::Opcode::CompareMaskGtU32: EmitCompareMaskU32(state, inst, OpUGreaterThan); break;
