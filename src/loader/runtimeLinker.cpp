@@ -618,6 +618,12 @@ static bool IsDumpableRange(uint64_t addr, uint64_t size) {
 #endif
 }
 
+// Muro-18 lesson (boot 37): do NOT install a SIGABRT handler to capture the Rosetta
+// "EmulateForward" abort. Delivering a signal to an x86 handler needs the exact state
+// reconstruction machinery whose failure triggered the abort, so Rosetta wedges instead
+// of dying and the process hangs (had to be SIGKILLed). The per-flip watched-range dump
+// is the surviving forensic channel.
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -643,12 +649,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}();
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			// Rosetta aborts internally when a wide unaligned store splits across a page
-			// boundary into a watched page (muro 18); sample the faults this rip resolves
-			// fine so the destination buffer of the crash site is known from the log.
+			// boundary into a watched page (muro 18); sample the faults the guest memcpy
+			// family resolves fine so the crash-site pattern (edge graze vs. sequential
+			// copy into a watched run) can be told apart from the log.
 			static std::atomic_uint64_t g_sampled_faults {0};
-			if (info->exception_address == 0xb0737d123ull) {
+			if (info->exception_address >= 0xb0737c000ull &&
+			    info->exception_address < 0xb0737e000ull) {
 				const auto count = g_sampled_faults.fetch_add(1, std::memory_order_relaxed);
-				if (count < 8 || (count & 0x3ffu) == 0) {
+				if (count < 64 || (count & 0xffu) == 0) {
 					fprintf(stderr,
 					        "gpu-fault-sample: rip=0x%016" PRIx64 " vaddr=0x%016" PRIx64
 					        " access=%u count=%" PRIu64 "\n",

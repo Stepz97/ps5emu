@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -57,6 +58,18 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 constexpr uint32_t NO_ACCESS_PROTECTION  = PAGE_NOACCESS;
 constexpr uint32_t READ_ONLY_PROTECTION  = PAGE_READONLY;
 constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
+
+// Muro 18 (Rosetta split-store abort): a wide unaligned guest store that crosses a page
+// boundary with the first page writable and the second one watch-protected aborts inside
+// Rosetta before any signal is delivered (known Apple bug, no fix — shadPS4#735). The
+// mitigation arms the page just below a watched run as a read-only "guard": the split
+// store then faults cleanly at instruction start (the case Rosetta handles), and the
+// fault path disarms the guard and resolves the watched successor page together before
+// the retry. DISARMED is a breadcrumb so late-arriving faults on a just-disarmed guard
+// still dispatch into the page manager instead of being filtered as unknown addresses.
+constexpr uint8_t GUARD_NONE     = 0;
+constexpr uint8_t GUARD_ARMED    = 1;
+constexpr uint8_t GUARD_DISARMED = 2;
 
 #if defined(__APPLE__)
 // Map the tracker's Win32-style protection tags to POSIX mprotect flags.
@@ -320,6 +333,7 @@ struct PageManager::Impl {
 		uint32_t         access_watchers     = 0;
 		uint32_t         original_protection = 0;
 		uint32_t         backing_writer      = 0;
+		uint8_t          guard_state         = GUARD_NONE;
 #if defined(__linux__)
 		// Shadow the protection applied through Protect().
 		uint32_t current_protection = UNKNOWN_PROTECTION;
@@ -699,6 +713,16 @@ bool PageManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return true;
 }
 
+bool PageManager::IsGuarded(uint64_t vaddr) const noexcept {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	auto&     page = m_impl->GetPage(*region, vaddr);
+	SpinGuard lock(page.lock);
+	return page.guard_state != GUARD_NONE;
+}
+
 bool PageManager::HasGpuAccess(uint64_t vaddr, uint64_t size, GpuAccess access) const noexcept {
 	if (access != GpuAccess::Read && access != GpuAccess::Write && access != GpuAccess::ReadWrite) {
 		FailFast("HasGpuAccess received an invalid GPU access mode");
@@ -724,6 +748,48 @@ bool PageManager::HasGpuAccess(uint64_t vaddr, uint64_t size, GpuAccess access) 
 	return true;
 }
 
+void PageManager::DumpWatchedRanges(std::FILE* out) const noexcept {
+	uint64_t run_start = 0;
+	uint32_t run_mode  = 0; // 0 = unwatched, 1 = write-watched, 2 = access-watched, 3 = guard
+	uint64_t run_total = 0;
+	const auto flush_run = [&](uint64_t end) {
+		if (run_mode != 0) {
+			std::fprintf(out,
+			             "watched-range: [0x%016" PRIx64 ", 0x%016" PRIx64 ") pages=%" PRIu64
+			             " mode=%s\n",
+			             run_start, end, (end - run_start) / PAGE_SIZE,
+			             run_mode == 2   ? "no-access"
+			             : run_mode == 1 ? "read-only"
+			                             : "guard");
+			run_total++;
+		}
+		run_mode = 0;
+	};
+	for (uint64_t index = 0; index < REGION_COUNT; index++) {
+		const auto* region      = m_impl->regions[index].load(std::memory_order_acquire);
+		const auto  region_base = index * REGION_SIZE;
+		if (region == nullptr) {
+			flush_run(region_base);
+			continue;
+		}
+		for (uint64_t page = 0; page < REGION_PAGES; page++) {
+			const auto&    state = region->pages[page];
+			const auto     vaddr = region_base + page * PAGE_SIZE;
+			const uint32_t mode  = state.access_watchers != 0 ? 2u
+			                       : state.write_watchers != 0
+			                           ? 1u
+			                           : (state.guard_state == GUARD_ARMED ? 3u : 0u);
+			if (mode != run_mode) {
+				flush_run(vaddr);
+				run_start = vaddr;
+				run_mode  = mode;
+			}
+		}
+	}
+	flush_run(ADDRESS_SIZE);
+	std::fprintf(out, "watched-range: total=%" PRIu64 " ranges\n", run_total);
+}
+
 void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
                                      PageWatchMode mode) {
 	if (mode != PageWatchMode::Write && mode != PageWatchMode::ReadWrite) {
@@ -745,6 +811,26 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 		for (auto address = chunk_begin; address < chunk_end; address += PAGE_SIZE) {
 			pages.push_back(&m_impl->GetPage(*region, address));
 		}
+		// The chunk's first page may need a guard armed (track) or disarmed (untrack) on
+		// its predecessor, which lives outside the locked span; its lock is taken first
+		// to preserve ascending lock order.
+		[[maybe_unused]] Impl::PageState*         prev_page = nullptr;
+		[[maybe_unused]] uint64_t                 prev_addr = 0;
+		[[maybe_unused]] std::optional<SpinGuard> prev_lock;
+#if defined(__APPLE__)
+		if (chunk_begin >= PAGE_SIZE) {
+			prev_addr = chunk_begin - PAGE_SIZE;
+			if (track) {
+				prev_page = &m_impl->GetPage(*m_impl->GetOrCreateRegion(prev_addr), prev_addr);
+			} else if (auto* prev_region = m_impl->FindRegion(prev_addr);
+			           prev_region != nullptr) {
+				prev_page = &m_impl->GetPage(*prev_region, prev_addr);
+			}
+			if (prev_page != nullptr) {
+				prev_lock.emplace(prev_page->lock);
+			}
+		}
+#endif
 		Impl::PageRangeGuard lock(pages);
 
 		std::vector<uint8_t> first_watchers(page_count);
@@ -775,6 +861,19 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 		}
 
 		if (track) {
+			// A page becoming a real watched page stops being a guard: restore its
+			// protection first or ValidateInitialProtection kills the process on the
+			// read-only guard state.
+			for (size_t i = 0; i < page_count; i++) {
+				auto& page = *pages[i];
+				if (first_watchers[i] != 0 && page.guard_state != GUARD_NONE) {
+					if (page.guard_state == GUARD_ARMED) {
+						Impl::Protect(page, chunk_begin + i * PAGE_SIZE, READ_WRITE_PROTECTION,
+						              READ_ONLY_PROTECTION, false);
+					}
+					page.guard_state = GUARD_NONE;
+				}
+			}
 			for (size_t first = 0; first < page_count;) {
 				while (first < page_count && first_watchers[first] == 0) {
 					first++;
@@ -812,6 +911,40 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 			}
 		}
 
+#if defined(__APPLE__)
+		// Arm a guard below every newly watched run BEFORE the run itself gets protected,
+		// so there is no window where a split store can cross into a watched page from a
+		// still-unguarded writable one. Guards are only armed on pages we do not track as
+		// resources and whose real protection is plain read/write.
+		if (track) {
+			for (size_t i = 0; i < page_count; i++) {
+				if (first_watchers[i] == 0 || (i > 0 && first_watchers[i - 1] != 0)) {
+					continue; // only the first page of each newly watched run
+				}
+				Impl::PageState* guard      = nullptr;
+				uint64_t         guard_addr = 0;
+				if (i > 0) {
+					guard      = pages[i - 1];
+					guard_addr = chunk_begin + (i - 1) * PAGE_SIZE;
+				} else {
+					guard      = prev_page;
+					guard_addr = prev_addr;
+				}
+				if (guard == nullptr || guard->write_watchers != 0 ||
+				    guard->access_watchers != 0 || guard->guard_state == GUARD_ARMED ||
+				    guard->resolving) {
+					continue;
+				}
+				if (MachQueryPageProt(guard_addr) != PAGE_READWRITE) {
+					continue;
+				}
+				guard->guard_state = GUARD_ARMED;
+				Impl::Protect(*guard, guard_addr, READ_ONLY_PROTECTION, READ_WRITE_PROTECTION,
+				              false);
+			}
+		}
+#endif
+
 		for (size_t first = 0; first < page_count;) {
 			while (first < page_count && transitions[first] == 0) {
 				first++;
@@ -836,6 +969,22 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 			                   std::span {old_protections}.subspan(first, last - first), false);
 			first = current;
 		}
+
+#if defined(__APPLE__)
+		// Mirror of the arm loop for the untrack direction: once the chunk's first page
+		// ends fully unwatched (and its protection transition was not deferred to an
+		// active backing writer), the guard below it has nothing left to protect, so it
+		// is disarmed HERE, after the range itself was unprotected — the reverse order
+		// would open a window with the range still protected and no guard below it.
+		// Interior pages never own guards (a guard only ever precedes a range start).
+		if (!track && prev_page != nullptr && prev_page->guard_state == GUARD_ARMED &&
+		    pages[0]->write_watchers == 0 && pages[0]->access_watchers == 0 &&
+		    pages[0]->backing_writer == 0) {
+			prev_page->guard_state = GUARD_NONE;
+			Impl::Protect(*prev_page, prev_addr, READ_WRITE_PROTECTION, READ_ONLY_PROTECTION,
+			              false);
+		}
+#endif
 
 		for (size_t i = 0; i < page_count; i++) {
 			auto&      page       = *pages[i];
@@ -1028,8 +1177,31 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 	if (region == nullptr) {
 		return false;
 	}
-	auto& page   = m_impl->GetPage(*region, fault_vaddr);
-	bool  waited = false;
+	auto&    page            = m_impl->GetPage(*region, fault_vaddr);
+	uint64_t guard_successor = 0;
+	{
+		// Deliberately not #if __APPLE__: guard_state can only leave GUARD_NONE on Apple
+		// (the arm loop is gated), so this branch is dead-but-cheap elsewhere and keeps
+		// HandleFault's structure identical across platforms.
+		SpinGuard guard_lock(page.lock);
+		if (access == PageFaultAccess::Write && page.guard_state != GUARD_NONE &&
+		    page.write_watchers == 0 && page.access_watchers == 0) {
+			if (page.guard_state == GUARD_ARMED) {
+				page.guard_state = GUARD_DISARMED;
+				Impl::Protect(page, PageStart(fault_vaddr), READ_WRITE_PROTECTION,
+				              READ_ONLY_PROTECTION, true);
+			}
+			guard_successor = PageStart(fault_vaddr) + PAGE_SIZE;
+		}
+	}
+	if (guard_successor != 0) {
+		// Resolve the watched successor together with the guard so the retried split
+		// store crosses two writable pages. Plain top-level recursion is safe here:
+		// g_in_fault_resolution is only set around the resolver callbacks, and depth
+		// is bounded by consecutive armed guards, each disarmed before recursing.
+		return HandleFault(PageFaultAccess::Write, guard_successor);
+	}
+	bool waited = false;
 	while (true) {
 		SpinGuard lock(page.lock);
 		if (access == PageFaultAccess::Read && page.late_read_pending &&

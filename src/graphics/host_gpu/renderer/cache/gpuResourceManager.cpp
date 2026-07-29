@@ -36,7 +36,11 @@ bool GpuResourceManager::InvalidateMemory(PageFaultAccess access, uint64_t vaddr
 }
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	if (!m_page_manager.IsMapped(fault_vaddr, 1)) {
+	// A muro-18 guard page is deliberately NOT a mapped GPU resource, so the IsMapped
+	// gate alone would filter its fault out before the page manager could disarm it and
+	// resolve the watched successor.
+	const bool guarded = m_page_manager.IsGuarded(fault_vaddr);
+	if (!guarded && !m_page_manager.IsMapped(fault_vaddr, 1)) {
 		return false;
 	}
 	if (CommandScheduler::InDeferredOperation()) {
@@ -45,9 +49,15 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		     fault_vaddr, static_cast<uint32_t>(access));
 	}
 	bool       handled = false;
-	const auto resolve = [this, access, fault_vaddr, &handled](CommandProcessor& cp) {
+	const auto resolve = [this, access, fault_vaddr, guarded, &handled](CommandProcessor& cp) {
 		cp.BeginReadbackTransaction();
 		(void)m_buffer_cache.SynchronizeBacking(fault_vaddr, 1);
+		if (guarded) {
+			// The page manager resolves the guard's watched successor in the same pass;
+			// synchronize its backing up front like any directly faulting page.
+			(void)m_buffer_cache.SynchronizeBacking(fault_vaddr + m_page_manager.GetPageSize(),
+			                                        1);
+		}
 		{
 			ResourceMutex::FaultScope fault(m_resource_mutex);
 			handled = m_page_manager.HandleFault(access, fault_vaddr);

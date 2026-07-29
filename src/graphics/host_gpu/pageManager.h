@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <cstdio>
 #include <memory>
 #include <span>
 #include <vector>
@@ -41,6 +42,8 @@ public:
 	[[nodiscard]] uint64_t GetPageSize() const;
 	[[nodiscard]] bool     IsTracked(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool     IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// True when the page is (or was recently) a muro-18 guard below a watched range.
+	[[nodiscard]] bool IsGuarded(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool HasGpuAccess(uint64_t vaddr, uint64_t size, GpuAccess access) const noexcept;
 
 	void UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
@@ -51,6 +54,10 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] std::vector<std::unique_ptr<BackingWrite>>
 	ReserveBackingWrites(std::span<const RangeSet::Range> ranges);
+	// Forensic snapshot of every contiguous watched page range. Lock-free on purpose so
+	// it stays callable from a terminating signal handler; the racy reads are acceptable
+	// for a post-mortem dump.
+	void DumpWatchedRanges(std::FILE* out) const noexcept;
 
 private:
 	void BeginBackingWrite(uint64_t vaddr, uint64_t size) noexcept;

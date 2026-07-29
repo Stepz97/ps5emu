@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -640,6 +641,20 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 
 	LOGF("dumped scan-out frame to %s (%ux%u pitch=%" PRIu64 ")\n", path.c_str(), width, height,
 	     pitch_bytes);
+
+	// Muro-18 forensics: snapshot the watched page ranges alongside the frame, so the
+	// last state before a Rosetta abort survives on disk. Same temp+rename discipline.
+	auto watches_path = path;
+	watches_path += ".watches.txt";
+	auto watches_temp = watches_path;
+	watches_temp += ".tmp";
+	if (FILE* watches = fopen(watches_temp.c_str(), "w"); watches != nullptr) {
+		LibKernel::Memory::DumpGpuWatchedRanges(watches);
+		fclose(watches);
+		if (std::rename(watches_temp.c_str(), watches_path.c_str()) != 0) {
+			LOGF("failed to move watched-range dump into place: %s\n", watches_path.c_str());
+		}
+	}
 }
 
 VideoOutDriver::VideoOutDriver(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
