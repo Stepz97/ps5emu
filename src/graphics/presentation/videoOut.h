@@ -16,6 +16,7 @@ class Presenter;
 
 namespace Libs::VideoOut {
 
+struct VideoOutBufferAttribute;
 struct VideoOutBufferAttribute2;
 struct VideoOutFlipStatus;
 struct VideoOutVblankStatus;
@@ -57,6 +58,11 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
                                                uint32_t width, uint32_t height, uint64_t option,
                                                uint32_t dcc_control,
                                                uint64_t dcc_cb_register_clear_color);
+// PS4 (v1)
+KYTY_SYSV_ABI void VideoOutSetBufferAttribute(VideoOutBufferAttribute* attribute,
+                                              uint32_t pixel_format, uint32_t tiling_mode,
+                                              uint32_t aspect_ratio, uint32_t width, uint32_t height,
+                                              uint32_t pitch_in_pixel);
 KYTY_SYSV_ABI int  VideoOutSetFlipRate(int handle, int rate);
 KYTY_SYSV_ABI int  VideoOutAddFlipEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                         void* udata);
@@ -74,6 +80,10 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
                                            const VideoOutBuffers* buffers, int buffer_num,
                                            const VideoOutBufferAttribute2* attribute, int category,
                                            void* option);
+// PS4 (v1)
+KYTY_SYSV_ABI int VideoOutRegisterBuffers(int handle, int buffer_index_start,
+                                          void* const* addresses, int buffer_num,
+                                          const VideoOutBufferAttribute* attribute);
 KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index,
                                                        const VideoOutBufferAttribute2* attribute,
                                                        void*                           option);
