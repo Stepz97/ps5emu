@@ -900,6 +900,12 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+void DumpGpuWatchedRanges(std::FILE* out) noexcept {
+	if (g_gpu_resources != nullptr) {
+		g_gpu_resources->DumpWatchedRanges(out);
+	}
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;

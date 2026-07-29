@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <cstdio>
 #include <memory>
 #include <span>
 #include <vector>
@@ -34,6 +35,11 @@ public:
 	KYTY_CLASS_NO_COPY(PageManager);
 
 	[[nodiscard]] uint64_t GetPageSize() const;
+	// True when the page is (or was recently) a muro-18 guard below a watched range.
+	[[nodiscard]] bool IsGuarded(uint64_t vaddr) const noexcept;
+	// Disarms a muro-18 guard at vaddr if armed, restoring plain read-write access. No-op
+	// otherwise.
+	void DisarmGuard(uint64_t vaddr) noexcept;
 
 	void UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 	                        PageWatchMode mode = PageWatchMode::Write);
@@ -42,6 +48,10 @@ public:
 
 	[[nodiscard]] std::vector<std::unique_ptr<BackingWrite>>
 	ReserveBackingWrites(std::span<const RangeSet::Range> ranges);
+	// Forensic snapshot of every contiguous watched page range. Lock-free on purpose so
+	// it stays callable from a terminating signal handler; the racy reads are acceptable
+	// for a post-mortem dump.
+	void DumpWatchedRanges(std::FILE* out) const noexcept;
 
 private:
 	void BeginBackingWrite(uint64_t vaddr, uint64_t size) noexcept;

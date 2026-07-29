@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <shared_mutex>
 
 namespace Libs::Graphics {
@@ -27,6 +28,7 @@ public:
 	void                        SetGpu(Gpu* gpu) noexcept { m_gpu = gpu; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	void DumpWatchedRanges(std::FILE* out) const noexcept { m_page_manager.DumpWatchedRanges(out); }
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

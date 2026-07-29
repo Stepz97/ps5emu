@@ -14,7 +14,11 @@ GpuResourceManager::~GpuResourceManager() = default;
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	constexpr uint64_t fault_size = 8;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	// A muro-18 guard page is deliberately NOT a mapped GPU resource, so the IsMapped
+	// gate alone would filter its fault out before the page manager could disarm it and
+	// resolve the watched successor.
+	const bool guarded = m_page_manager.IsGuarded(fault_vaddr);
+	if (!guarded && !IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
 	if (CommandScheduler::InDeferredOperation()) {
@@ -23,10 +27,22 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		     fault_vaddr, static_cast<uint32_t>(access));
 	}
 	bool       handled = false;
-	const auto resolve = [this, access, fault_vaddr, &handled](CommandProcessor& cp) {
+	const auto resolve = [this, access, fault_vaddr, guarded, &handled](CommandProcessor& cp) {
 		cp.BeginReadbackTransaction();
 		{
 			ResourceMutex::FaultScope fault(m_resource_mutex);
+			if (guarded) {
+				// Disarm the guard and resolve the watched successor together so a
+				// retried split store crosses two writable pages (muro 18).
+				m_page_manager.DisarmGuard(fault_vaddr);
+				const auto successor = fault_vaddr + m_page_manager.GetPageSize();
+				if (access == PageFaultAccess::Write) {
+					m_buffer_cache.InvalidateMemory(successor, fault_size);
+					m_texture_cache.InvalidateMemory(successor, fault_size);
+				} else {
+					m_buffer_cache.ReadMemory(successor, fault_size);
+				}
+			}
 			if (access == PageFaultAccess::Write) {
 				m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 				m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
