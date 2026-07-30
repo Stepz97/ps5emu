@@ -109,6 +109,44 @@ uint32_t EmitWqmLaneU32(EmitterState& state, uint32_t src) {
 	return ret;
 }
 
+// s_wqm_b32: the 32-bit half of the whole-quad-mode expansion its 64-bit sibling below
+// already implements. Same lane arithmetic (EmitWqmLaneU32), one dword instead of two.
+void EmitWqmB32(EmitterState& state, const IR::Instruction& inst) {
+	if ((state.single_lane_subgroup || !state.per_invocation_masks) &&
+	    inst.dst.kind == IR::OperandKind::Register &&
+	    inst.dst.reg.file == IR::RegisterFile::Scalar) {
+		const auto value = EmitValueLoad(state, inst.src[0]);
+		EmitStoreU32(state, inst.dst, EmitWqmLaneU32(state, value));
+		return;
+	}
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction({OpGroupNonUniformBallot, state.vec4_uint_type, ballot,
+	                           ConstantU32(state, ScopeSubgroup),
+	                           EmitLaneMaskOperandActiveBool(state, inst.src[0])});
+	const auto low = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, state.uint_type, low, ballot, 0});
+	const auto wqm       = EmitWqmLaneU32(state, low);
+	const auto lane      = EmitSubgroupLocalInvocationId(state);
+	const auto bit_index = state.builder.AllocateId();
+	const auto bit       = state.builder.AllocateId();
+	const auto hit       = state.builder.AllocateId();
+	const auto active    = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, state.uint_type, bit_index, lane, ConstantU32(state, 31)});
+	state.builder.AddFunction(
+	    {OpShiftLeftLogical, state.uint_type, bit, ConstantU32(state, 1), bit_index});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, hit, wqm, bit});
+	state.builder.AddFunction({OpINotEqual, state.bool_type, active, hit, ConstantU32(state, 0)});
+	if (state.per_invocation_masks) {
+		EmitPerInvocationMask(state, inst.dst, active);
+	} else {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelect, state.uint_type, result, active,
+		                           ConstantU32(state, 1), ConstantU32(state, 0)});
+		EmitStoreU32(state, inst.dst, result);
+	}
+}
+
 void EmitWqmB64(EmitterState& state, const IR::Instruction& inst) {
 	if ((state.single_lane_subgroup || !state.per_invocation_masks) &&
 	    inst.dst.kind == IR::OperandKind::Register &&

@@ -18,6 +18,7 @@ struct LowerMap {
 constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::SMovB32, Opcode::MoveU32},
     {Decoder::Opcode::SMovB64, Opcode::MoveU64},
+    {Decoder::Opcode::SWqmB32, Opcode::WqmB32},
     {Decoder::Opcode::SWqmB64, Opcode::WqmB64},
     {Decoder::Opcode::SMovkI32, Opcode::MoveU32},
     {Decoder::Opcode::SAbsI32, Opcode::AbsI32},

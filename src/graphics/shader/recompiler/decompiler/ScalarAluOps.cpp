@@ -34,6 +34,7 @@ constexpr OpcodeMap SOP1_OPS[] = {
     {0x04u, Opcode::SMovB64},
     {0x07u, Opcode::SNotB32},
     {0x08u, Opcode::SNotB64},
+    {0x09u, Opcode::SWqmB32},
     {0x0au, Opcode::SWqmB64},
     {0x0bu, Opcode::SBrevB32},
     {0x0fu, Opcode::SBcnt1I32B32},
