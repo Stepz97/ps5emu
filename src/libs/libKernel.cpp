@@ -2629,6 +2629,7 @@ static thread_local FiberCpuContext               g_thread_fiber_context {};
 // kyty-owned stack for any context below the host minimum; the game's buffer stays
 // untouched (magic included), since a fiber only ever sees its stack through rsp.
 constexpr uint64_t                                FIBER_CONTEXT_HOST_MIN = 0x400000;
+
 struct FiberHostStack {
 	void*    base = nullptr;
 	uint64_t size = 0;
@@ -2792,7 +2793,15 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 // the saved frame pointer instead of the return address — the restored context would jump into
 // the stack (AccessViolation/Execute at a stack address). Naked functions guarantee that on entry
 // (%rsp) is the return address and no register has been touched. SysV ABI: ctx arrives in %rdi.
-__attribute__((naked, returns_twice)) static int FiberSaveContext(FiberCpuContext* ctx) {
+// These two are naked bodies that read their arguments straight out of %rdi/%rsi, i.e.
+// the SysV register order. Without an explicit ABI they inherit the platform default,
+// which on Windows is the MS x64 convention (%rcx/%rdx) - the asm then reads whatever
+// the caller happened to leave in %rdi/%rsi. Those are callee-saved on Win64, so the
+// value is plausible often enough for a fiber switch to appear to work and then jump
+// through a garbage context later: a non-deterministic crash inside the context switch,
+// with the guest nowhere near it.
+__attribute__((naked, returns_twice)) static int KYTY_SYSV_ABI
+FiberSaveContext(FiberCpuContext* ctx) {
 	asm volatile("movq %rbx, 0(%rdi)\n\t"
 	             "movq %rbp, 8(%rdi)\n\t"
 	             "movq %rdi, 16(%rdi)\n\t"
@@ -2811,8 +2820,8 @@ __attribute__((naked, returns_twice)) static int FiberSaveContext(FiberCpuContex
 
 // SysV ABI: ctx in %rdi, ret in %rsi. %rax is loaded from %rsi before %rsi is overwritten and
 // %rdi is restored last, for the same reason.
-__attribute__((naked, noreturn)) static void FiberRestoreContext(FiberCpuContext* ctx,
-                                                                 uint64_t         ret) {
+__attribute__((naked, noreturn)) static void KYTY_SYSV_ABI
+FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	asm volatile("movq %rsi, %rax\n\t"
 	             "movq 72(%rdi), %r11\n\t"
 	             "movq 0(%rdi), %rbx\n\t"
