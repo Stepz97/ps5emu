@@ -638,13 +638,17 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	    depth_tile || tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
 	// Real descriptors can be self-inconsistent: Astro Bot binds base=last=6 on a
-	// MaxMip=5 texture (muro 23). Hardware tolerates the out-of-range level by reading
-	// the clamped mip, so mirror that instead of rejecting the whole bind.
+	// MaxMip=5 texture (muro 23, storage twin muro 24). Hardware tolerates the
+	// out-of-range level by reading the clamped mip, so mirror that instead of
+	// rejecting the whole bind. The descriptor copy is rewritten too: the storage
+	// validators and the view creation read the mip range straight from fields[3].
 	if (!multisampled && levels != 0 && last_level >= levels) {
 		LOGF("texture mip view clamped: base=%u last=%u levels=%u\n", base_level, last_level,
 		     levels);
 		last_level = levels - 1u;
 		base_level = std::min(base_level, last_level);
+		descriptor.fields[3] =
+		    (descriptor.fields[3] & ~0x000FF000u) | (base_level << 12u) | (last_level << 16u);
 	}
 	if ((!multisampled && base_level > last_level) ||
 	    (multisampled &&
