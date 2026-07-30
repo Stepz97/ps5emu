@@ -551,6 +551,36 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 		}
 
 #if defined(__APPLE__)
+		// Inverse edge (boot-45 residual): untracking can leave a still-watched range
+		// immediately ABOVE the freed pages. The last freed page is converted into the
+		// neighbor's guard BEFORE protections are applied, by overriding its target
+		// protection to READ_ONLY: a write-watched page then simply STAYS read-only
+		// (no transition, no window), instead of bouncing through a writable instant
+		// between two mprotect calls (review finding on the first version of this).
+		if (!track && chunk_end == end && chunk_end < ADDRESS_SIZE) {
+			auto* last_page = pages[page_count - 1];
+			if (last_page->write_watchers == 0 && last_page->access_watchers == 0 &&
+			    last_page->backing_writer == 0 && last_page->guard_state != GUARD_ARMED &&
+			    !last_page->resolving) {
+				bool successor_watched = false;
+				if (auto* next_region = m_impl->FindRegion(chunk_end); next_region != nullptr) {
+					auto&     next_page = m_impl->GetPage(*next_region, chunk_end);
+					SpinGuard next_lock(next_page.lock);
+					successor_watched =
+					    next_page.write_watchers != 0 || next_page.access_watchers != 0;
+				}
+				if (successor_watched) {
+					last_page->guard_state          = GUARD_ARMED;
+					new_protections[page_count - 1] = READ_ONLY_PROTECTION;
+					transitions[page_count - 1] =
+					    (new_protections[page_count - 1] != old_protections[page_count - 1] &&
+					     last_page->backing_writer == 0)
+					        ? 1
+					        : 0;
+				}
+			}
+		}
+
 		// Arm a guard below every newly watched run BEFORE the run itself gets protected,
 		// so there is no window where a split store can cross into a watched page from a
 		// still-unguarded writable one. Guards are only armed on pages we do not track as
@@ -575,6 +605,12 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 					continue;
 				}
 				if (MachQueryPageProt(guard_addr) != PAGE_READWRITE) {
+					// Muro-18 residual probe: an edge whose guard was skipped here is the
+					// prime suspect for the remaining sporadic Rosetta abort.
+					std::fprintf(stderr,
+					             "guard-skip: 0x%016" PRIx64 " not RW at arm time (run base 0x%016" PRIx64
+					             ")\n",
+					             guard_addr, chunk_begin + i * PAGE_SIZE);
 					continue;
 				}
 				guard->guard_state = GUARD_ARMED;
@@ -621,6 +657,7 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 			prev_page->guard_state = GUARD_NONE;
 			m_impl->Protect(*prev_page, prev_addr, READ_WRITE_PROTECTION, READ_ONLY_PROTECTION);
 		}
+
 #endif
 
 		for (auto* page: pages) {
