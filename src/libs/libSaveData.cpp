@@ -493,13 +493,19 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 	     setup_param->option, setup_param->user_id, static_cast<uint64_t>(setup_param->memory_size),
 	     static_cast<uint64_t>(setup_param->icon_memory_size), setup_param->slot_id);
 
+	// Muro 27: existed_memory_size is how the game detects a virgin boot — it must be
+	// the size BEFORE this setup call. Reporting the post-resize size made Astro Bot
+	// believe a save existed, skip its first-boot default initialization, read 20+
+	// zero-filled JSON documents from the memory block, and assert on a missing
+	// boolean key (Network/Json.cpp:399).
+	const auto existed_size = g_save_data_memory.size();
 	if (setup_param->memory_size > g_save_data_memory.size()) {
 		g_save_data_memory.resize(setup_param->memory_size);
 	}
 
 	if (result != nullptr) {
 		*result                     = {};
-		result->existed_memory_size = g_save_data_memory.size();
+		result->existed_memory_size = existed_size;
 	}
 
 	return OK;
