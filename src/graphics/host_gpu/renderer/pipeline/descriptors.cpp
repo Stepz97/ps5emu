@@ -294,13 +294,16 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 	                                     (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
 	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
-	const uint32_t     field5_expected =
-	    0x00700000u | (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
+	// PerfMod (dword5 bits 20-22) is a fetch-performance hint with no bearing on
+	// correctness; Astro Bot sends both 7 and 0 on depth targets (muro 20), so it is
+	// masked out instead of being pinned to the first value ever observed.
+	constexpr uint32_t field5_perf_mod_mask = 0x00700000u;
+	const uint32_t     field5_expected      = static_cast<uint32_t>(descriptor.MaxMip()) << 4u;
 	const bool common = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	                    (descriptor.fields[2] & field2_reserved_mask) == 0 &&
 	                    descriptor.fields[3] == field3_expected &&
 	                    descriptor.fields[4] == field4_expected &&
-	                    descriptor.fields[5] == field5_expected;
+	                    (descriptor.fields[5] & ~field5_perf_mod_mask) == field5_expected;
 	if (!common || (descriptor.fields[6] == 0 && descriptor.fields[7] != 0)) {
 		return false;
 	}
@@ -412,7 +415,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descriptor) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
-	constexpr uint32_t field5_expected      = 0x00700000u;
+	// PerfMod is a fetch-performance hint — ignored, same as the sampled-depth path.
+	constexpr uint32_t field5_perf_mod_mask = 0x00700000u;
 	constexpr uint32_t field5_max_mip_mask  = 0x000000f0u;
 	const uint32_t     expected_field3 = descriptor.DstSelXYZW() |
 	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
@@ -424,7 +428,7 @@ static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descr
 	return (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	       (descriptor.fields[2] & field2_reserved_mask) == 0 &&
 	       descriptor.fields[3] == expected_field3 && descriptor.fields[4] == expected_field4 &&
-	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected;
+	       (descriptor.fields[5] & ~(field5_max_mip_mask | field5_perf_mod_mask)) == 0;
 }
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
