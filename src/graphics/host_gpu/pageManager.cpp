@@ -67,9 +67,25 @@ constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 // fault path disarms the guard and resolves the watched successor page together before
 // the retry. DISARMED is a breadcrumb so late-arriving faults on a just-disarmed guard
 // still dispatch into the page manager instead of being filtered as unknown addresses.
+//
+// Muro 18 residual: Astro Bot allocates 16-byte aligned parameter blocks right below
+// watched texture runs and rewrites them every frame with unrolled 32-byte AVX stores.
+// An object that happens to straddle the guard's own BOTTOM boundary makes one of those
+// stores split from the writable page below into the read-only guard — the exact abort
+// the guard exists to prevent, one page lower. (Burning the faulted guard instead was
+// tried and is strictly worse: an unguarded re-tracked run start is fatal for objects
+// near the guard page's top — boots 90/91 died at flips 139/12 versus a ~400 average.)
+// The mitigation is guard DEPTH: arming GUARD_DEPTH_PAGES below each run start moves
+// the fatal writable->read-only edge that many pages away from the hot allocations
+// that cluster tightly under image bases; a store landing anywhere inside the guard
+// zone starts on a read-only page and faults cleanly at instruction start.
 constexpr uint8_t GUARD_NONE     = 0;
 constexpr uint8_t GUARD_ARMED    = 1;
 constexpr uint8_t GUARD_DISARMED = 2;
+
+// Pages of guard below each watched run. Depth 2 puts the fatal edge 8 KB under the
+// run base; every hot CPU write observed so far lands within the first page.
+constexpr uint64_t GUARD_DEPTH_PAGES = 2;
 
 #if defined(__APPLE__)
 // Map the tracker's Win32-style protection tags to POSIX mprotect flags.
@@ -811,23 +827,30 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 		for (auto address = chunk_begin; address < chunk_end; address += PAGE_SIZE) {
 			pages.push_back(&m_impl->GetPage(*region, address));
 		}
-		// The chunk's first page may need a guard armed (track) or disarmed (untrack) on
-		// its predecessor, which lives outside the locked span; its lock is taken first
-		// to preserve ascending lock order.
-		[[maybe_unused]] Impl::PageState*         prev_page = nullptr;
-		[[maybe_unused]] uint64_t                 prev_addr = 0;
-		[[maybe_unused]] std::optional<SpinGuard> prev_lock;
+		// The chunk's first pages may need guards armed (track) or disarmed (untrack) on
+		// their predecessors, which live outside the locked span; their locks are taken
+		// first, lowest address first, to preserve ascending lock order. Index
+		// GUARD_DEPTH_PAGES - 1 is the immediate predecessor of chunk_begin.
+		[[maybe_unused]] std::array<Impl::PageState*, GUARD_DEPTH_PAGES> prev_pages {};
+		[[maybe_unused]] std::array<uint64_t, GUARD_DEPTH_PAGES>         prev_addrs {};
+		[[maybe_unused]] std::array<std::optional<SpinGuard>, GUARD_DEPTH_PAGES> prev_locks;
 #if defined(__APPLE__)
-		if (chunk_begin >= PAGE_SIZE) {
-			prev_addr = chunk_begin - PAGE_SIZE;
-			if (track) {
-				prev_page = &m_impl->GetPage(*m_impl->GetOrCreateRegion(prev_addr), prev_addr);
-			} else if (auto* prev_region = m_impl->FindRegion(prev_addr);
-			           prev_region != nullptr) {
-				prev_page = &m_impl->GetPage(*prev_region, prev_addr);
+		for (uint64_t depth_index = 0; depth_index < GUARD_DEPTH_PAGES; depth_index++) {
+			const uint64_t below = (GUARD_DEPTH_PAGES - depth_index) * PAGE_SIZE;
+			if (chunk_begin < below) {
+				continue;
 			}
-			if (prev_page != nullptr) {
-				prev_lock.emplace(prev_page->lock);
+			const auto       addr = chunk_begin - below;
+			Impl::PageState* page = nullptr;
+			if (track) {
+				page = &m_impl->GetPage(*m_impl->GetOrCreateRegion(addr), addr);
+			} else if (auto* prev_region = m_impl->FindRegion(addr); prev_region != nullptr) {
+				page = &m_impl->GetPage(*prev_region, addr);
+			}
+			if (page != nullptr) {
+				prev_addrs[depth_index] = addr;
+				prev_pages[depth_index] = page;
+				prev_locks[depth_index].emplace(page->lock);
 			}
 		}
 #endif
@@ -942,41 +965,53 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 			}
 		}
 
-		// Arm a guard below every newly watched run BEFORE the run itself gets protected,
-		// so there is no window where a split store can cross into a watched page from a
-		// still-unguarded writable one. Guards are only armed on pages we do not track as
-		// resources and whose real protection is plain read/write.
+		// Arm a guard zone below every newly watched run BEFORE the run itself gets
+		// protected, so there is no window where a split store can cross into a watched
+		// page from a still-unguarded writable one. The zone is armed bottom-up so no
+		// writable page ever sits below a freshly protected one while it grows. Guards
+		// are only armed on pages we do not track as resources and whose real protection
+		// is plain read/write; a page that fails those checks is left alone without
+		// stopping shallower levels (watched or otherwise protected pages are already a
+		// safe floor for the zone).
 		if (track) {
 			for (size_t i = 0; i < page_count; i++) {
 				if (first_watchers[i] == 0 || (i > 0 && first_watchers[i - 1] != 0)) {
 					continue; // only the first page of each newly watched run
 				}
-				Impl::PageState* guard      = nullptr;
-				uint64_t         guard_addr = 0;
-				if (i > 0) {
-					guard      = pages[i - 1];
-					guard_addr = chunk_begin + (i - 1) * PAGE_SIZE;
-				} else {
-					guard      = prev_page;
-					guard_addr = prev_addr;
+				for (uint64_t depth = GUARD_DEPTH_PAGES; depth >= 1; depth--) {
+					Impl::PageState* guard      = nullptr;
+					uint64_t         guard_addr = 0;
+					if (i >= depth) {
+						guard      = pages[i - depth];
+						guard_addr = chunk_begin + (i - depth) * PAGE_SIZE;
+					} else {
+						const auto below = depth - i; // pages below chunk_begin, 1-based
+						if (below <= GUARD_DEPTH_PAGES) {
+							const auto index = GUARD_DEPTH_PAGES - below;
+							guard            = prev_pages[index];
+							guard_addr       = prev_addrs[index];
+						}
+					}
+					if (guard == nullptr || guard->write_watchers != 0 ||
+					    guard->access_watchers != 0 || guard->guard_state == GUARD_ARMED ||
+					    guard->resolving) {
+						continue;
+					}
+					if (MachQueryPageProt(guard_addr) != PAGE_READWRITE) {
+						if (depth == 1) {
+							// Muro-18 residual probe: an edge whose innermost guard was
+							// skipped here is the prime suspect for a sporadic abort.
+							std::fprintf(stderr,
+							             "guard-skip: 0x%016" PRIx64
+							             " not RW at arm time (run base 0x%016" PRIx64 ")\n",
+							             guard_addr, chunk_begin + i * PAGE_SIZE);
+						}
+						continue;
+					}
+					guard->guard_state = GUARD_ARMED;
+					Impl::Protect(*guard, guard_addr, READ_ONLY_PROTECTION, READ_WRITE_PROTECTION,
+					              false);
 				}
-				if (guard == nullptr || guard->write_watchers != 0 ||
-				    guard->access_watchers != 0 || guard->guard_state == GUARD_ARMED ||
-				    guard->resolving) {
-					continue;
-				}
-				if (MachQueryPageProt(guard_addr) != PAGE_READWRITE) {
-					// Muro-18 residual probe: an edge whose guard was skipped here is the
-					// prime suspect for the remaining sporadic Rosetta abort.
-					std::fprintf(stderr,
-					             "guard-skip: 0x%016" PRIx64 " not RW at arm time (run base 0x%016" PRIx64
-					             ")\n",
-					             guard_addr, chunk_begin + i * PAGE_SIZE);
-					continue;
-				}
-				guard->guard_state = GUARD_ARMED;
-				Impl::Protect(*guard, guard_addr, READ_ONLY_PROTECTION, READ_WRITE_PROTECTION,
-				              false);
 			}
 		}
 #endif
@@ -1009,16 +1044,24 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 #if defined(__APPLE__)
 		// Mirror of the arm loop for the untrack direction: once the chunk's first page
 		// ends fully unwatched (and its protection transition was not deferred to an
-		// active backing writer), the guard below it has nothing left to protect, so it
-		// is disarmed HERE, after the range itself was unprotected — the reverse order
-		// would open a window with the range still protected and no guard below it.
-		// Interior pages never own guards (a guard only ever precedes a range start).
-		if (!track && prev_page != nullptr && prev_page->guard_state == GUARD_ARMED &&
-		    pages[0]->write_watchers == 0 && pages[0]->access_watchers == 0 &&
+		// active backing writer), the guard zone below it has nothing left to protect,
+		// so it is disarmed HERE, after the range itself was unprotected — the reverse
+		// order would open a window with the range still protected and no guard below
+		// it. Walking top-down keeps every intermediate state free of a writable page
+		// sitting under a read-only one. Interior pages never own guards (a guard only
+		// ever precedes a range start).
+		if (!track && pages[0]->write_watchers == 0 && pages[0]->access_watchers == 0 &&
 		    pages[0]->backing_writer == 0) {
-			prev_page->guard_state = GUARD_NONE;
-			Impl::Protect(*prev_page, prev_addr, READ_WRITE_PROTECTION, READ_ONLY_PROTECTION,
-			              false);
+			for (uint64_t depth = 1; depth <= GUARD_DEPTH_PAGES; depth++) {
+				const auto index = GUARD_DEPTH_PAGES - depth;
+				auto*      guard = prev_pages[index];
+				if (guard == nullptr || guard->guard_state != GUARD_ARMED) {
+					continue;
+				}
+				guard->guard_state = GUARD_NONE;
+				Impl::Protect(*guard, prev_addrs[index], READ_WRITE_PROTECTION,
+				              READ_ONLY_PROTECTION, false);
+			}
 		}
 
 #endif
