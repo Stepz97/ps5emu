@@ -12,7 +12,9 @@
 
 #include <cstdio>
 #include <fmt/format.h>
+#if defined(__APPLE__)
 #include <pthread.h>
+#endif
 
 using namespace Common;
 using namespace Emulator;
@@ -245,9 +247,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 int main(int argc, char* argv[]) {
+#if defined(__APPLE__)
+	// Darwin-only diagnostic left from the muro-18 stack work; pthread_get_stackaddr_np
+	// does not exist elsewhere.
 	fprintf(stderr, "[stack-probe] main stack top ~%p, local ~%p\n",
 	        pthread_get_stackaddr_np(pthread_self()), (void*)&argc);
 	fflush(stderr);
+#endif
 
 	auto& slist = *SubsystemsList::Instance();
 

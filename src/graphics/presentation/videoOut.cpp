@@ -628,9 +628,11 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 	// Write to a temp file and rename over the target so a crash mid-dump (the very
 	// scenario the per-flip overwrite exists to capture) never truncates the last
 	// complete frame.
-	auto temp_path = path;
-	temp_path += ".tmp";
-	FILE* file = fopen(temp_path.c_str(), "wb");
+	// std::filesystem::path::c_str() is wchar_t* on Windows; convert once and use the
+	// narrow copy for every fopen/rename/LOGF below.
+	const auto path_utf8 = path.string();
+	auto       temp_path = path_utf8 + ".tmp";
+	FILE*      file      = fopen(temp_path.c_str(), "wb");
 	if (file == nullptr) {
 		LOGF("failed to open %s for scan-out dump\n", temp_path.c_str());
 		return;
@@ -687,8 +689,8 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 	}
 
 	fclose(file);
-	if (std::rename(temp_path.c_str(), path.c_str()) != 0) {
-		LOGF("failed to move scan-out dump into place: %s\n", path.c_str());
+	if (std::rename(temp_path.c_str(), path_utf8.c_str()) != 0) {
+		LOGF("failed to move scan-out dump into place: %s\n", path_utf8.c_str());
 		return;
 	}
 
@@ -697,21 +699,19 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 	if (packed_10_10_10_2) {
 		LOGF("dumped scan-out frame to %s (%ux%u pitch=%" PRIu64 " addr=0x%016" PRIx64
 		     " chmax=(%u,%u,%u) amax=%u nonzero_rgb_px=%" PRIu64 ")\n",
-		     path.c_str(), width, height, pitch_bytes, info.data.address, probe_max_low,
+		     path_utf8.c_str(), width, height, pitch_bytes, info.data.address, probe_max_low,
 		     probe_max_mid, probe_max_high, probe_max_alpha, probe_nonzero_rgb);
 	} else {
 		LOGF("dumped scan-out frame to %s (%ux%u pitch=%" PRIu64 " addr=0x%016" PRIx64
 		     " chmax_raw8=(%u,%u,%u) nonzero_rgb_px=%" PRIu64 ")\n",
-		     path.c_str(), width, height, pitch_bytes, info.data.address, probe_max_low,
+		     path_utf8.c_str(), width, height, pitch_bytes, info.data.address, probe_max_low,
 		     probe_max_mid, probe_max_high, probe_nonzero_rgb);
 	}
 
 	// Muro-18 forensics: snapshot the watched page ranges alongside the frame, so the
 	// last state before a Rosetta abort survives on disk. Same temp+rename discipline.
-	auto watches_path = path;
-	watches_path += ".watches.txt";
-	auto watches_temp = watches_path;
-	watches_temp += ".tmp";
+	auto watches_path = path_utf8 + ".watches.txt";
+	auto watches_temp = watches_path + ".tmp";
 	if (FILE* watches = fopen(watches_temp.c_str(), "w"); watches != nullptr) {
 		LibKernel::Memory::DumpGpuWatchedRanges(watches);
 		fclose(watches);
