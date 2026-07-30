@@ -754,12 +754,26 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		LOGF("stack: unavailable\n");
 	}
 
+#if defined(__APPLE__)
+	// The deep dump below (guest code hexdumps, guest stack walk, qword dumps) keeps
+	// finding new ways to fault inside a dying signal handler (muro 19 forensics: two
+	// distinct near-NULL derefs on two nights), and every masked original fault costs a
+	// full diagnostic cycle. The lines above carry all the value; stop here on macOS.
+	// Note the observable difference vs other platforms: this path no longer reaches the
+	// EXIT() below, so the process dies re-executing the faulting instruction under the
+	// default signal disposition (raw OS crash) instead of kyty's fail-fast exit code.
+	return false;
+#endif
+
+	// Muro-19 lesson: this dump runs in a dying signal handler that may have interrupted
+	// the runtime linker itself mid-mutation. FindProgramByAddr takes the linker mutex
+	// and walks Program entries (and Singleton::Instance() lazily mallocs) — re-entering
+	// that from here dereferenced a half-built entry and the nested fault masked the
+	// original one. The death dump probes readability and prints raw bytes, nothing else.
 	auto dump_guest_code = [](const char* name, uint64_t addr) {
-		auto* p = Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(addr);
-		if (p == nullptr || addr < p->base_vaddr) {
+		if (addr == 0) {
 			return;
 		}
-
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MEMORY_BASIC_INFORMATION mbi {};
 		auto* dump_ptr = reinterpret_cast<const uint8_t*>(addr >= 16 ? addr - 16 : addr);
@@ -779,9 +793,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 #endif
 
-		LOGF("%s code: addr=%016" PRIx64 ", off=%016" PRIx64 ", module=%s:", name, addr,
-		     addr - p->base_vaddr,
-		     Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name)).c_str());
+		LOGF("%s code: addr=%016" PRIx64 ":", name, addr);
 		for (uint32_t i = 0; i < dump_size; i++) {
 			LOGF(" %02" PRIx32, static_cast<uint32_t>(dump_ptr[i]));
 		}
@@ -808,16 +820,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			SysStackWalkX86(info->rbp, info->rsp, stack, &depth);
 
 			LOGF("Stack trace [thread = %d]:\n", Common::Thread::GetThreadIdUnique());
+			// Raw addresses only — no FindProgramByAddr here for the same signal-context
+			// reasons as dump_guest_code above (module offsets can be recovered offline
+			// from the load logs).
 			for (int i = 0; i < depth; i++) {
-				auto  vaddr = reinterpret_cast<uint64_t>(stack[i]);
-				auto* p =
-				    Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(vaddr);
-				LOGF("[%d] %016" PRIx64 ", off=%016" PRIx64 ", %s\n", i, vaddr,
-				     (p == nullptr ? 0 : vaddr - p->base_vaddr),
-				     (p == nullptr ? "???"
-				                   : Common::FilenameWithoutDirectory(
-				                         Common::PathToGenericString(p->file_name))
-				                         .c_str()));
+				LOGF("[%d] %016" PRIx64 "\n", i, reinterpret_cast<uint64_t>(stack[i]));
 			}
 		}
 

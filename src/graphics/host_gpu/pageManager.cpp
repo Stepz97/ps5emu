@@ -912,6 +912,36 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 		}
 
 #if defined(__APPLE__)
+		// Inverse edge (boot-45 residual): untracking can leave a still-watched range
+		// immediately ABOVE the freed pages. The last freed page is converted into the
+		// neighbor's guard BEFORE protections are applied, by overriding its target
+		// protection to READ_ONLY: a write-watched page then simply STAYS read-only
+		// (no transition, no window), instead of bouncing through a writable instant
+		// between two mprotect calls (review finding on the first version of this).
+		if (!track && chunk_end == end && chunk_end < ADDRESS_SIZE) {
+			auto* last_page = pages[page_count - 1];
+			if (last_page->write_watchers == 0 && last_page->access_watchers == 0 &&
+			    last_page->backing_writer == 0 && last_page->guard_state != GUARD_ARMED &&
+			    !last_page->resolving) {
+				bool successor_watched = false;
+				if (auto* next_region = m_impl->FindRegion(chunk_end); next_region != nullptr) {
+					auto&     next_page = m_impl->GetPage(*next_region, chunk_end);
+					SpinGuard next_lock(next_page.lock);
+					successor_watched =
+					    next_page.write_watchers != 0 || next_page.access_watchers != 0;
+				}
+				if (successor_watched) {
+					last_page->guard_state          = GUARD_ARMED;
+					new_protections[page_count - 1] = READ_ONLY_PROTECTION;
+					transitions[page_count - 1] =
+					    (new_protections[page_count - 1] != old_protections[page_count - 1] &&
+					     last_page->backing_writer == 0)
+					        ? 1
+					        : 0;
+				}
+			}
+		}
+
 		// Arm a guard below every newly watched run BEFORE the run itself gets protected,
 		// so there is no window where a split store can cross into a watched page from a
 		// still-unguarded writable one. Guards are only armed on pages we do not track as
@@ -936,6 +966,12 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 					continue;
 				}
 				if (MachQueryPageProt(guard_addr) != PAGE_READWRITE) {
+					// Muro-18 residual probe: an edge whose guard was skipped here is the
+					// prime suspect for the remaining sporadic Rosetta abort.
+					std::fprintf(stderr,
+					             "guard-skip: 0x%016" PRIx64 " not RW at arm time (run base 0x%016" PRIx64
+					             ")\n",
+					             guard_addr, chunk_begin + i * PAGE_SIZE);
 					continue;
 				}
 				guard->guard_state = GUARD_ARMED;
@@ -984,6 +1020,7 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 			Impl::Protect(*prev_page, prev_addr, READ_WRITE_PROTECTION, READ_ONLY_PROTECTION,
 			              false);
 		}
+
 #endif
 
 		for (size_t i = 0; i < page_count; i++) {
@@ -1186,20 +1223,25 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 		SpinGuard guard_lock(page.lock);
 		if (access == PageFaultAccess::Write && page.guard_state != GUARD_NONE &&
 		    page.write_watchers == 0 && page.access_watchers == 0) {
+			guard_successor = PageStart(fault_vaddr) + PAGE_SIZE;
+		}
+	}
+	if (guard_successor != 0) {
+		// Resolve the watched successor BEFORE disarming the guard: the reverse order
+		// briefly leaves a writable page under a watched one — exactly the split-store
+		// window this machinery exists to prevent. Plain top-level recursion is safe:
+		// g_in_fault_resolution is only set around the resolver callbacks, and depth is
+		// bounded by consecutive guards, each consumed before recursing.
+		const bool successor_ok = HandleFault(PageFaultAccess::Write, guard_successor);
+		{
+			SpinGuard guard_lock(page.lock);
 			if (page.guard_state == GUARD_ARMED) {
 				page.guard_state = GUARD_DISARMED;
 				Impl::Protect(page, PageStart(fault_vaddr), READ_WRITE_PROTECTION,
 				              READ_ONLY_PROTECTION, true);
 			}
-			guard_successor = PageStart(fault_vaddr) + PAGE_SIZE;
 		}
-	}
-	if (guard_successor != 0) {
-		// Resolve the watched successor together with the guard so the retried split
-		// store crosses two writable pages. Plain top-level recursion is safe here:
-		// g_in_fault_resolution is only set around the resolver callbacks, and depth
-		// is bounded by consecutive armed guards, each disarmed before recursing.
-		return HandleFault(PageFaultAccess::Write, guard_successor);
+		return successor_ok;
 	}
 	bool waited = false;
 	while (true) {

@@ -8,7 +8,9 @@
 #include <windows.h> // IWYU pragma: keep
 #elif defined(__APPLE__)
 #include <csignal>
+#include <execinfo.h>
 #include <sys/ucontext.h>
+#include <unistd.h>
 #else
 #include <csignal>
 #include <initializer_list>
@@ -171,6 +173,27 @@ static AccessViolationType DecodeAccess(uint64_t err) {
 // fault restores the default disposition so the retry terminates the process.
 static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	if (g_in_exception_filter) {
+		// Forensics for the nested-fault fail-fast (muro 19): say where the nested fault
+		// landed before dying, or the log gives no lead at all on this class of bug.
+		const auto* uc = static_cast<const ucontext_t*>(uctx);
+		std::fprintf(stderr,
+		             "nested host exception: sig=%d addr=0x%016llx rip=0x%016llx err=0x%llx"
+		             " handler=%p\n",
+		             sig, reinterpret_cast<unsigned long long>(si->si_addr),
+		             uc != nullptr && uc->uc_mcontext != nullptr
+		                 ? static_cast<unsigned long long>(uc->uc_mcontext->__ss.__rip)
+		                 : 0ull,
+		             uc != nullptr && uc->uc_mcontext != nullptr
+		                 ? static_cast<unsigned long long>(uc->uc_mcontext->__es.__err)
+		                 : 0ull,
+		             reinterpret_cast<void*>(&SignalHandler));
+		std::fflush(stderr);
+		// The process is dying anyway; a backtrace from signal context is worth the risk
+		// and names the faulting resolver path directly.
+		void*     frames[24] {};
+		const int frame_count =
+		    ::backtrace(frames, static_cast<int>(sizeof(frames) / sizeof(frames[0])));
+		::backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
 		FailFast("nested exception while resolving a host fault");
 	}
 	g_in_exception_filter = true;

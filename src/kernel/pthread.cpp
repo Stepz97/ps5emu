@@ -79,6 +79,13 @@ constexpr int      KEYS_MAX                  = 256;
 constexpr int      DESTRUCTOR_ITERATIONS     = 4;
 constexpr size_t   PTHREAD_STACK_DEFAULT     = 0x100000;
 constexpr size_t   GUEST_PTHREAD_STACK_MIN   = 0x4000;
+// Guest threads run host library code (libsystem_pthread, dyld, driver stacks) on
+// their guest stacks, with far larger frames than the PS5's native libkernel. Stacks
+// the game sizes for the console (32-64 KiB workers are common in Astro Bot) overflow
+// under those frames — seen as a read fault just below the stack's bottom guard page
+// (muro 19). Every guest stack is therefore clamped to a host-comfortable minimum;
+// the attr reports the real mapped size afterwards, so guest semantics stay honest.
+constexpr size_t   PTHREAD_STACK_HOST_MIN    = 0x80000;
 constexpr size_t   PTHREAD_STACK_PAGE        = 0x4000;
 constexpr size_t   PTHREAD_STACK_GRANULARITY = 0x10000;
 constexpr size_t   PTHREAD_STACK_INITIAL     = 0x200000;
@@ -713,14 +720,28 @@ static int CreateGuestStack(PthreadAttr attr) {
 	}
 
 	if (attr->stack_addr != nullptr) {
-		attr->guard_size     = 0;
-		attr->stack_user     = true;
-		attr->stack_map_addr = 0;
-		attr->stack_map_size = 0;
-		return OK;
+		// Game-provided stacks sized for the console (Astro Bot hands out 32-64 KiB
+		// worker stacks from its own heap) overflow under host library frames exactly
+		// like the sized-by-attr ones (muro 19) — and the clamp below can't grow a
+		// buffer the game owns. Substitute a kyty-owned stack of the host minimum and
+		// leave the game's buffer unused; threads only ever see the stack through rsp.
+		if (attr->stack_size < PTHREAD_STACK_HOST_MIN) {
+			std::fprintf(stderr,
+			             "guest-stack: replacing user stack %p (%zu bytes) with a host-min "
+			             "allocation\n",
+			             attr->stack_addr, attr->stack_size);
+			attr->stack_addr = nullptr;
+		} else {
+			attr->guard_size     = 0;
+			attr->stack_user     = true;
+			attr->stack_map_addr = 0;
+			attr->stack_map_size = 0;
+			return OK;
+		}
 	}
 
-	const auto stack_size = RoundStackSize(attr->stack_size);
+	const auto stack_size =
+	    RoundStackSize(std::max(attr->stack_size, PTHREAD_STACK_HOST_MIN));
 	const auto guard_size = RoundStackSize(attr->guard_size);
 	const auto map_size   = RoundStackMappingSize(stack_size + guard_size);
 
