@@ -103,10 +103,12 @@ IsSupportedSampledDepthUintResource(const ShaderRecompiler::IR::ImageResource& r
 
 inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_format,
                                      uint32_t swizzle) noexcept {
-	const auto srgb_view = SrgbStorageViewFormat(image_format);
-	const bool srgb_storage_view =
-	    srgb_view != vk::Format::eUndefined && view_format == srgb_view;
-	if ((image_format != view_format && !srgb_storage_view) ||
+	// Storage views may alias any format within the image's compatibility class, same as
+	// the sampled path (color images are created with eMutableFormat | eExtendedUsage and
+	// FindView re-checks compatibility at view creation). Astro Bot writes an R32Sfloat
+	// image through a B10G11R11Ufloat view (muro 21); the sRGB-as-Unorm storage case is
+	// in the same class, so FormatsCompatible subsumes the old special case too.
+	if (!ImageViewOps::FormatsCompatible(image_format, view_format) ||
 	    !IsValidImageSwizzle(swizzle)) {
 		UnsupportedColorView("storage", image_format, view_format, swizzle);
 	}
