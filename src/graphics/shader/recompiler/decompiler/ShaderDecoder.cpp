@@ -444,6 +444,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SAndSaveexecB32: return "s_and_saveexec_b32";
 		case Opcode::SAndn1SaveexecB32: return "s_andn1_saveexec_b32";
 		case Opcode::SAndSaveexecB64: return "s_and_saveexec_b64";
+		case Opcode::SOrn2SaveexecB32: return "s_orn2_saveexec_b32";
 		case Opcode::SOrn2SaveexecB64: return "s_orn2_saveexec_b64";
 		case Opcode::SAndn1SaveexecB64: return "s_andn1_saveexec_b64";
 		case Opcode::SNotB32: return "s_not_b32";
@@ -1009,6 +1010,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::SAndSaveexecB32:
 		case Opcode::SAndn1SaveexecB32:
 		case Opcode::SAndSaveexecB64:
+		case Opcode::SOrn2SaveexecB32:
 		case Opcode::SOrn2SaveexecB64:
 		case Opcode::SAndn1SaveexecB64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,

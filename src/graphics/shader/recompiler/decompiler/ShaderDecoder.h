@@ -51,6 +51,7 @@ enum class Opcode {
 	SAndSaveexecB32,
 	SAndn1SaveexecB32,
 	SAndSaveexecB64,
+	SOrn2SaveexecB32,
 	SOrn2SaveexecB64,
 	SAndn1SaveexecB64,
 	SNotB32,
