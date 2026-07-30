@@ -119,6 +119,7 @@ enum class Opcode {
 	SCmpGeU32,
 	SCmpLtU32,
 	SCmpLeU32,
+	SCmpEqU64,
 	SCmpLgU64,
 
 	VNop,

@@ -211,7 +211,8 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>& 
 			    inst.op == IR::Opcode::FindLsbU64) {
 				CollectSequentialRegisters(registers, inst.src[0], 2);
 			}
-			if (inst.op == IR::Opcode::CompareNeU64 || inst.op == IR::Opcode::CompareGtU64) {
+			if (inst.op == IR::Opcode::CompareEqU64 || inst.op == IR::Opcode::CompareNeU64 ||
+			    inst.op == IR::Opcode::CompareGtU64) {
 				CollectSequentialRegisters(registers, inst.src[0], 2);
 				CollectSequentialRegisters(registers, inst.src[1], 2);
 			}
@@ -425,6 +426,7 @@ bool IsCompareOpcode(IR::Opcode op) {
 		case IR::Opcode::CompareGeU32:
 		case IR::Opcode::CompareLtU32:
 		case IR::Opcode::CompareLeU32:
+		case IR::Opcode::CompareEqU64:
 		case IR::Opcode::CompareNeU64:
 		case IR::Opcode::CompareGtU64:
 		case IR::Opcode::CompareMaskEqU32:

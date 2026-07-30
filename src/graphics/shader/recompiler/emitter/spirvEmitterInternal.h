@@ -1350,6 +1350,7 @@ void EmitCompareI16(EmitterState& state, const IR::Instruction& inst, uint32_t o
 
 void EmitBitCompareB32(EmitterState& state, const IR::Instruction& inst, bool bit_set);
 
+void EmitCompareEqU64(EmitterState& state, const IR::Instruction& inst);
 void EmitCompareNeU64(EmitterState& state, const IR::Instruction& inst);
 
 void EmitCompareGtU64(EmitterState& state, const IR::Instruction& inst);

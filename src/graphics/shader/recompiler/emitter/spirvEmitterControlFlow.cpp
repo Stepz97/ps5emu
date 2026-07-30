@@ -517,6 +517,7 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::CompareGeU32: EmitCompareU32(state, inst, OpUGreaterThanEqual); break;
 		case IR::Opcode::CompareLtU32: EmitCompareU32(state, inst, OpULessThan); break;
 		case IR::Opcode::CompareLeU32: EmitCompareU32(state, inst, OpULessThanEqual); break;
+		case IR::Opcode::CompareEqU64: EmitCompareEqU64(state, inst); break;
 		case IR::Opcode::CompareNeU64: EmitCompareNeU64(state, inst); break;
 		case IR::Opcode::CompareGtU64: EmitCompareGtU64(state, inst); break;
 		case IR::Opcode::ImageBvhIntersectRay: EmitImageBvhIntersectRayMiss(state, inst); break;
