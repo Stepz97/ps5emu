@@ -46,8 +46,18 @@ public:
 			           static_cast<uint32_t>(GetLastError()));
 			return;
 		}
+		// A hint-less ~14 GiB alias was observed landing across the guest's fixed-address
+		// band (host-committed pages at 0x400000000 broke the GpuOnionMemory fixed map:
+		// mapped views cannot be decommitted by any guest-side replace path). Pin the
+		// alias above HOST_USER_MAX so it can never collide with a guest-reachable
+		// address; fall back to a hint-less view only if that address is taken.
 		m_backing_base = static_cast<uint8_t*>(
-		    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		    MapViewOfFileEx(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size,
+		                    reinterpret_cast<void*>(0x10000000000ull)));
+		if (m_backing_base == nullptr) {
+			m_backing_base = static_cast<uint8_t*>(
+			    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		}
 		if (m_backing_base == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t direct-memory backing: writable alias failed: 0x%08" PRIx32 "\n",

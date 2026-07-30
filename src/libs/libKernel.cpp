@@ -2682,6 +2682,44 @@ static thread_local FiberObject*                  g_thread_return_fiber = nullpt
 static thread_local FiberObject*                  g_starting_fiber      = nullptr;
 static thread_local FiberObject*                  g_pending_idle_fiber  = nullptr;
 static thread_local FiberCpuContext               g_thread_fiber_context {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Fibers run the guest's code on the context buffer the game hands out, sized for the
+// PS5's own libkernel. Host library frames are far larger (muro 19, already solved for
+// pthread stacks in CreateGuestStack) and a fiber stack that overflows walks straight
+// down into whatever the game placed below the buffer - here, the FiberObject itself,
+// 0x228 bytes under GameMain's context, whose magic_start it zeroed. Substitute a
+// kyty-owned stack for any context below the host minimum; the game's buffer stays
+// untouched (magic included), since a fiber only ever sees its stack through rsp.
+constexpr uint64_t                                FIBER_CONTEXT_HOST_MIN = 0x400000;
+struct FiberHostStack {
+	void*    base = nullptr;
+	uint64_t size = 0;
+};
+static std::mutex                                 g_fiber_host_stack_mutex;
+static std::unordered_map<FiberObject*, FiberHostStack> g_fiber_host_stacks;
+
+static FiberHostStack FiberFindHostStack(FiberObject* fiber) {
+	std::lock_guard lock(g_fiber_host_stack_mutex);
+	auto            it = g_fiber_host_stacks.find(fiber);
+	return it != g_fiber_host_stacks.end() ? it->second : FiberHostStack {};
+}
+
+static void FiberReleaseHostStack(FiberObject* fiber) {
+	FiberHostStack stack {};
+	{
+		std::lock_guard lock(g_fiber_host_stack_mutex);
+		auto            it = g_fiber_host_stacks.find(fiber);
+		if (it == g_fiber_host_stacks.end()) {
+			return;
+		}
+		stack = it->second;
+		g_fiber_host_stacks.erase(it);
+	}
+	if (stack.base != nullptr) {
+		VirtualFree(stack.base, 0, MEM_RELEASE);
+	}
+}
+#endif
 static std::mutex                                 g_fiber_owner_mutex;
 static std::unordered_map<FiberObject*, uint64_t> g_fiber_owner_thread;
 static std::unordered_map<uint64_t, FiberObject*> g_fiber_current_by_thread;
@@ -2867,8 +2905,15 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 [[noreturn]] static void FiberStartOnGuestStack(FiberObject* fiber) {
 	FiberCpuContext ctx {};
-	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
-	                            static_cast<uintptr_t>(fiber->size_context);
+	auto            context_base = reinterpret_cast<uintptr_t>(fiber->addr_context);
+	auto            context_size = static_cast<uintptr_t>(fiber->size_context);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (const auto host_stack = FiberFindHostStack(fiber); host_stack.base != nullptr) {
+		context_base = reinterpret_cast<uintptr_t>(host_stack.base);
+		context_size = static_cast<uintptr_t>(host_stack.size);
+	}
+#endif
+	const auto      stack_top = context_base + context_size;
 	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	rsp -= 4u * sizeof(uint64_t);
@@ -2911,22 +2956,26 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 	PRINT_NAME();
 
 	if (fiber == nullptr || name == nullptr || entry == nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_NULL\n", __func__);
 		return FIBER_ERROR_NULL;
 	}
 
 	if ((reinterpret_cast<uint64_t>(fiber) & 7u) != 0 ||
 	    (reinterpret_cast<uint64_t>(addr_context) & 15u) != 0 ||
 	    (opt_param != nullptr && (reinterpret_cast<uint64_t>(opt_param) & 7u) != 0)) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_ALIGNMENT\n", __func__);
 		return FIBER_ERROR_ALIGNMENT;
 	}
 
 	if (size_context != 0 && size_context < FIBER_CONTEXT_MIN_SIZE) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_RANGE\n", __func__);
 		return FIBER_ERROR_RANGE;
 	}
 
 	if ((size_context & 15u) != 0 || (addr_context == nullptr && size_context != 0) ||
 	    (addr_context != nullptr && size_context == 0) ||
 	    (opt_param != nullptr && opt_param->magic != FIBER_OPT_MAGIC)) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_INVALID\n", __func__);
 		return FIBER_ERROR_INVALID;
 	}
 
@@ -2952,10 +3001,22 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 		*static_cast<uint64_t*>(addr_context) = FIBER_STACK_MAGIC;
 	}
 
-	LOGF("\t fiber init: %s, entry = 0x%016" PRIx64 ", context = 0x%016" PRIx64 ", size = %" PRIu64
-	     "\n",
-	     fiber->name, reinterpret_cast<uint64_t>(entry), reinterpret_cast<uint64_t>(addr_context),
-	     size_context);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	FiberReleaseHostStack(fiber);
+	if (size_context < FIBER_CONTEXT_HOST_MIN) {
+		if (auto* host_stack = VirtualAlloc(nullptr, FIBER_CONTEXT_HOST_MIN,
+		                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		    host_stack != nullptr) {
+			std::lock_guard lock(g_fiber_host_stack_mutex);
+			g_fiber_host_stacks[fiber] = FiberHostStack {host_stack, FIBER_CONTEXT_HOST_MIN};
+		}
+	}
+#endif
+
+	LOGF("\t fiber init: %s, obj = 0x%016" PRIx64 ", entry = 0x%016" PRIx64 ", context = 0x%016" PRIx64
+	     ", size = %" PRIu64 "\n",
+	     fiber->name, reinterpret_cast<uint64_t>(fiber), reinterpret_cast<uint64_t>(entry),
+	     reinterpret_cast<uint64_t>(addr_context), size_context);
 
 	return OK;
 }
@@ -2977,9 +3038,11 @@ int32_t KYTY_SYSV_ABI FiberOptParamInitialize(FiberOptParam* opt_param) {
 	PRINT_NAME();
 
 	if (opt_param == nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_NULL\n", __func__);
 		return FIBER_ERROR_NULL;
 	}
 	if ((reinterpret_cast<uint64_t>(opt_param) & 7u) != 0) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_ALIGNMENT\n", __func__);
 		return FIBER_ERROR_ALIGNMENT;
 	}
 
@@ -2993,14 +3056,21 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	PRINT_NAME();
 
 	if (fiber == nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_NULL\n", __func__);
 		return FIBER_ERROR_NULL;
 	}
 	if (!FiberIsValid(fiber)) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_INVALID\n", __func__);
 		return FIBER_ERROR_INVALID;
 	}
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED)) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_STATE\n", __func__);
 		return FIBER_ERROR_STATE;
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	FiberReleaseHostStack(fiber);
+#endif
 
 	return OK;
 }
@@ -3009,12 +3079,20 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	PRINT_NAME();
 
 	if (!FiberIsValid(fiber)) {
+		LOGF_COLOR(Log::Color::Red,
+		           "\t fiber error: %s -> FIBER_ERROR_INVALID obj=0x%016" PRIx64
+		           " magic_start=0x%08" PRIx32 " magic_end=0x%08" PRIx32 " state=%" PRIu32 "\n",
+		           __func__, reinterpret_cast<uint64_t>(fiber),
+		           fiber != nullptr ? fiber->magic_start : 0u,
+		           fiber != nullptr ? fiber->magic_end : 0u, fiber != nullptr ? fiber->state : 0u);
 		return FIBER_ERROR_INVALID;
 	}
 	if (g_current_fiber != nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_PERMISSION\n", __func__);
 		return FIBER_ERROR_PERMISSION;
 	}
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_STATE\n", __func__);
 		return FIBER_ERROR_STATE;
 	}
 
@@ -3038,7 +3116,13 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 		*arg_on_return = returned_fiber->arg_on_return;
 	}
 
-	return (FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK);
+	if (FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED) {
+		LOGF_COLOR(Log::Color::Red,
+		           "\t fiber error: %s -> FIBER_ERROR_STATE (returned fiber terminated)\n",
+		           __func__);
+		return FIBER_ERROR_STATE;
+	}
+	return OK;
 }
 
 int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
@@ -3046,9 +3130,11 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	PRINT_NAME();
 
 	if (!FiberIsValid(fiber)) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_INVALID\n", __func__);
 		return FIBER_ERROR_INVALID;
 	}
 	if (g_current_fiber == nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_PERMISSION\n", __func__);
 		return FIBER_ERROR_PERMISSION;
 	}
 
@@ -3060,6 +3146,7 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 		if (FiberRepairStaleRunningOnThisThread(fiber, observed_state)) {
 			continue;
 		}
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_STATE\n", __func__);
 		return FIBER_ERROR_STATE;
 	}
 
@@ -3092,6 +3179,7 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	PRINT_NAME();
 
 	if (fiber == nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_NULL\n", __func__);
 		return FIBER_ERROR_NULL;
 	}
 
@@ -3104,6 +3192,7 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 	PRINT_NAME();
 
 	if (g_current_fiber == nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_PERMISSION\n", __func__);
 		return FIBER_ERROR_PERMISSION;
 	}
 
@@ -3131,9 +3220,11 @@ int32_t KYTY_SYSV_ABI FiberGetInfo(FiberObject* fiber, FiberInfo* fiber_info) {
 	PRINT_NAME();
 
 	if (fiber == nullptr || fiber_info == nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_NULL\n", __func__);
 		return FIBER_ERROR_NULL;
 	}
 	if (!FiberIsValid(fiber)) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_INVALID\n", __func__);
 		return FIBER_ERROR_INVALID;
 	}
 
@@ -3163,9 +3254,11 @@ int32_t KYTY_SYSV_ABI FiberRename(FiberObject* fiber, const char* name) {
 	PRINT_NAME();
 
 	if (fiber == nullptr || name == nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_NULL\n", __func__);
 		return FIBER_ERROR_NULL;
 	}
 	if (!FiberIsValid(fiber)) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_INVALID\n", __func__);
 		return FIBER_ERROR_INVALID;
 	}
 
@@ -3179,6 +3272,7 @@ int32_t KYTY_SYSV_ABI FiberGetThreadFramePointerAddress(uint64_t* addr_frame_poi
 	PRINT_NAME();
 
 	if (addr_frame_pointer == nullptr) {
+		LOGF_COLOR(Log::Color::Red, "\t fiber error: %s -> FIBER_ERROR_NULL\n", __func__);
 		return FIBER_ERROR_NULL;
 	}
 
