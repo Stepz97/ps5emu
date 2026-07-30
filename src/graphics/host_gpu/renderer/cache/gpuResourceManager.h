@@ -30,6 +30,10 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	void DumpWatchedRanges(std::FILE* out) const noexcept { m_page_manager.DumpWatchedRanges(out); }
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Pull an image that lives at this address back into guest memory. The inverse of
+	// InvalidateMemory, and the only way instrumentation outside the renderer can look at
+	// what was actually drawn: the guest scan-out buffer is never written otherwise.
+	[[nodiscard]] bool SynchronizeImageToMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);

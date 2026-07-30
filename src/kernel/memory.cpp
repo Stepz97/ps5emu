@@ -891,6 +891,13 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
+bool SynchronizeGpuImageToMemory(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || g_gpu_resources == nullptr) {
+		return false;
+	}
+	return g_gpu_resources->SynchronizeImageToMemory(vaddr, size);
+}
+
 void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;

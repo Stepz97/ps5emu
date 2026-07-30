@@ -603,6 +603,20 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 		return;
 	}
 
+	// The renderer draws into a host image and presents that; nothing writes the guest
+	// scan-out buffer, so reading it straight gives an all-zero frame no matter what the
+	// game drew. Pull the image back first. Only reached with --dump-scanout set, so the
+	// normal present path keeps its timing.
+	if (!Libs::LibKernel::Memory::SynchronizeGpuImageToMemory(info.data.address,
+	                                                          info.data.size)) {
+		static std::atomic_bool warned {false};
+		if (!warned.exchange(true)) {
+			LOGF("scan-out dump: no GPU image to read back at 0x%016" PRIx64
+			     ", dumping raw guest memory\n",
+			     info.data.address);
+		}
+	}
+
 	const auto* base        = reinterpret_cast<const uint8_t*>(info.data.address);
 	const auto  width       = info.extent.width;
 	const auto  height      = info.extent.height;
@@ -621,12 +635,34 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 
 	fprintf(file, "P6\n%u %u\n255\n", width, height);
 
+	// A 4K scan-out is A2R10G10B10 packed into 32 bits, so the low three bytes are pieces
+	// of three different channels - dumping them raw produced an image whose red and green
+	// barely moved while blue swung wildly. Unpack the channels the format actually has.
+	const bool packed_10_10_10_2 =
+	    info.pixel_format == vk::Format::eA2R10G10B10UnormPack32 ||
+	    info.pixel_format == vk::Format::eA2B10G10R10UnormPack32;
+	const bool blue_first = info.pixel_format == vk::Format::eA2B10G10R10UnormPack32;
+
 	for (uint32_t row = 0; row < height; row++) {
 		const uint8_t* row_ptr = base + static_cast<uint64_t>(row) * pitch_bytes;
 		for (uint32_t col = 0; col < width; col++) {
-			// Raw bytes exactly as stored in the guest buffer, no channel reordering,
-			// so the real byte order can be diagnosed from the dump itself.
-			fwrite(row_ptr + static_cast<uint64_t>(col) * info.bytes_per_block, 1, 3, file);
+			const uint8_t* pixel = row_ptr + static_cast<uint64_t>(col) * info.bytes_per_block;
+			if (packed_10_10_10_2) {
+				uint32_t value = 0;
+				std::memcpy(&value, pixel, sizeof(value));
+				// Bits 0-9 / 10-19 / 20-29 are the three colour channels, 30-31 alpha;
+				// >> 2 scales each 10-bit channel into the PPM's 8 bits.
+				const uint8_t low  = static_cast<uint8_t>((value & 0x3ffu) >> 2u);
+				const uint8_t mid  = static_cast<uint8_t>(((value >> 10u) & 0x3ffu) >> 2u);
+				const uint8_t high = static_cast<uint8_t>(((value >> 20u) & 0x3ffu) >> 2u);
+				const uint8_t rgb[3] = {blue_first ? low : high, mid,
+				                        blue_first ? high : low};
+				fwrite(rgb, 1, 3, file);
+				continue;
+			}
+			// Anything else goes out as raw bytes, so an unexpected byte order can still be
+			// diagnosed from the dump itself.
+			fwrite(pixel, 1, 3, file);
 		}
 	}
 
