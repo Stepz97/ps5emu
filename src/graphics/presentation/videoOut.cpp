@@ -643,6 +643,12 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 	    info.pixel_format == vk::Format::eA2B10G10R10UnormPack32;
 	const bool blue_first = info.pixel_format == vk::Format::eA2B10G10R10UnormPack32;
 
+	// scanout-probe: per-channel maxima over the RAW pixels, so a dump can distinguish
+	// "image never written" (all channels 0) from "written with black RGB but live alpha"
+	// (alpha_max > 0) straight from the log line.
+	uint32_t probe_max_low = 0, probe_max_mid = 0, probe_max_high = 0, probe_max_alpha = 0;
+	uint64_t probe_nonzero_rgb = 0;
+
 	for (uint32_t row = 0; row < height; row++) {
 		const uint8_t* row_ptr = base + static_cast<uint64_t>(row) * pitch_bytes;
 		for (uint32_t col = 0; col < width; col++) {
@@ -650,6 +656,11 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 			if (packed_10_10_10_2) {
 				uint32_t value = 0;
 				std::memcpy(&value, pixel, sizeof(value));
+				probe_max_low   = std::max(probe_max_low, value & 0x3ffu);
+				probe_max_mid   = std::max(probe_max_mid, (value >> 10u) & 0x3ffu);
+				probe_max_high  = std::max(probe_max_high, (value >> 20u) & 0x3ffu);
+				probe_max_alpha = std::max(probe_max_alpha, value >> 30u);
+				probe_nonzero_rgb += (value & 0x3fffffffu) != 0 ? 1 : 0;
 				// Bits 0-9 / 10-19 / 20-29 are the three colour channels, 30-31 alpha;
 				// >> 2 scales each 10-bit channel into the PPM's 8 bits.
 				const uint8_t low  = static_cast<uint8_t>((value & 0x3ffu) >> 2u);
@@ -661,7 +672,13 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 				continue;
 			}
 			// Anything else goes out as raw bytes, so an unexpected byte order can still be
-			// diagnosed from the dump itself.
+			// diagnosed from the dump itself. Stats accumulate over the same raw bytes
+			// (reviewer finding: zeros here would fake the exact false-black this probe
+			// exists to rule out).
+			probe_max_low  = std::max<uint32_t>(probe_max_low, pixel[0]);
+			probe_max_mid  = std::max<uint32_t>(probe_max_mid, pixel[1]);
+			probe_max_high = std::max<uint32_t>(probe_max_high, pixel[2]);
+			probe_nonzero_rgb += (pixel[0] | pixel[1] | pixel[2]) != 0 ? 1 : 0;
 			fwrite(pixel, 1, 3, file);
 		}
 	}
@@ -672,8 +689,19 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 		return;
 	}
 
-	LOGF("dumped scan-out frame to %s (%ux%u pitch=%" PRIu64 ")\n", path.c_str(), width, height,
-	     pitch_bytes);
+	// Two log shapes so the channel interpretation is never ambiguous: 10-bit unpacked
+	// channels (+2-bit alpha) for the packed format, raw byte maxima otherwise.
+	if (packed_10_10_10_2) {
+		LOGF("dumped scan-out frame to %s (%ux%u pitch=%" PRIu64 " addr=0x%016" PRIx64
+		     " chmax=(%u,%u,%u) amax=%u nonzero_rgb_px=%" PRIu64 ")\n",
+		     path.c_str(), width, height, pitch_bytes, info.data.address, probe_max_low,
+		     probe_max_mid, probe_max_high, probe_max_alpha, probe_nonzero_rgb);
+	} else {
+		LOGF("dumped scan-out frame to %s (%ux%u pitch=%" PRIu64 " addr=0x%016" PRIx64
+		     " chmax_raw8=(%u,%u,%u) nonzero_rgb_px=%" PRIu64 ")\n",
+		     path.c_str(), width, height, pitch_bytes, info.data.address, probe_max_low,
+		     probe_max_mid, probe_max_high, probe_nonzero_rgb);
+	}
 
 	// Muro-18 forensics: snapshot the watched page ranges alongside the frame, so the
 	// last state before a Rosetta abort survives on disk. Same temp+rename discipline.

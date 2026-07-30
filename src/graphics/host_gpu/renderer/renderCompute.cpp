@@ -33,6 +33,7 @@
 #include <limits>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -214,6 +215,45 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+
+	// scanout-probe: log the FIRST sighting of every guest address a compute shader can
+	// write (buffers and storage images), to attribute which dispatch (if any) produces
+	// the buffer the scan-out presents. Runs BEFORE the clear fast-paths so clear targets
+	// are attributed too. Deduped; only active alongside --dump-scanout.
+	static const bool probe_enabled = !Config::GetDumpScanOutPath().empty();
+	if (probe_enabled && resources.buffers.size() == program.info.buffers.size() &&
+	    resources.images.size() == program.info.images.size()) {
+		static Common::Mutex                probe_mutex;
+		static std::unordered_set<uint64_t> probe_seen;
+		const auto probe_first_sight = [](uint64_t addr) {
+			Common::LockGuard probe_lock(probe_mutex);
+			return probe_seen.insert(addr).second;
+		};
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			if (!program.info.buffers[i].written) {
+				continue;
+			}
+			const auto r =
+			    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			if (r.Base48() != 0 && probe_first_sight(r.Base48())) {
+				LOGF("scanout-probe: cs buffer write base=0x%012" PRIx64 " size=0x%" PRIx64
+				     " shader=0x%016" PRIx64 "\n",
+				     r.Base48(), BufferDescriptorSize(r), cs_regs.cs_regs.data_addr);
+			}
+		}
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (!program.info.images[i].written) {
+				continue;
+			}
+			const auto r =
+			    DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+			if (r.Base40() != 0 && probe_first_sight(r.Base40())) {
+				LOGF("scanout-probe: cs image write base=0x%010" PRIx64
+				     " shader=0x%016" PRIx64 "\n",
+				     r.Base40(), cs_regs.cs_regs.data_addr);
+			}
+		}
+	}
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
