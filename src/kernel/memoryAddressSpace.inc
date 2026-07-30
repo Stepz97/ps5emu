@@ -538,29 +538,41 @@ private:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
-		const auto      end     = vaddr + size;
-		auto            current = vaddr;
-		while (current < end) {
-			MapEntry entry {};
-			if (!FindContainingUnlocked(current, 1, &entry)) {
-				return false;
+		// The transfer callback copies through guest-visible memory and can fault on a
+		// page-manager-watched page; the resolution path re-enters TryTransferBacking
+		// on the SAME thread (muro 25: the GPU thread self-deadlocked on m_mutex when a
+		// DmaData copy faulted mid-transfer and the invalidation called WriteBacking).
+		// Chunks are therefore collected under the lock (all-or-nothing validation is
+		// preserved) and the copies run with the lock released. A guest racing
+		// munmap/mmap against an in-flight transfer gets the same nondeterminism a real
+		// DMA engine would give it.
+		struct Chunk {
+			uint64_t backing_offset = 0;
+			uint64_t transfer_offset = 0;
+			size_t   bytes = 0;
+		};
+		std::vector<Chunk> chunks;
+		{
+			std::lock_guard lock(m_mutex);
+			const auto      end     = vaddr + size;
+			auto            current = vaddr;
+			while (current < end) {
+				MapEntry entry {};
+				if (!FindContainingUnlocked(current, 1, &entry)) {
+					return false;
+				}
+				const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
+				const auto offset = entry.backing_offset + current - entry.vaddr;
+				if (!RangeOk(offset, bytes)) {
+					return false;
+				}
+				chunks.push_back({offset, current - vaddr, static_cast<size_t>(bytes)});
+				current += bytes;
 			}
-			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
-			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
-				return false;
-			}
-			current += bytes;
 		}
 
-		current = vaddr;
-		while (current < end) {
-			MapEntry entry {};
-			EXIT_IF(!FindContainingUnlocked(current, 1, &entry));
-			const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
-			const auto offset = entry.backing_offset + current - entry.vaddr;
-			transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
-			current += bytes;
+		for (const auto& chunk: chunks) {
+			transfer(m_backing_base + chunk.backing_offset, chunk.transfer_offset, chunk.bytes);
 		}
 		return true;
 	}
