@@ -176,6 +176,30 @@ uint32_t VertexParameterInputPointerType(const EmitterState& state, VertexInputS
 
 void AllocateInputVariables(EmitterState& state) {
 	for (auto& binding: state.inputs) {
+		// A pixel shader can aim two of its input slots at the SAME vertex export
+		// (SPI_PS_INPUT_CNTL entries with equal OFFSET — Astro Bot does it with slots 2
+		// and 4, both raw 0x423). They have to share one SPIR-V input variable: giving
+		// the second one a location of its own invents a location the vertex shader
+		// never writes, and Metal rejects that pipeline outright (muro 31).
+		if (PixelParameterSharesEarlierVariable(state, binding)) {
+			const auto mapped = PixelParameterMappedLocation(state, binding.location);
+			uint32_t   shared = 0;
+			for (const auto& other: state.inputs) {
+				if (&other == &binding) {
+					break;
+				}
+				if (other.kind == IR::StageInputKind::Parameter && other.variable_id != 0 &&
+				    other.component_count == binding.component_count &&
+				    PixelParameterMappedLocation(state, other.location) == mapped) {
+					shared = other.variable_id;
+					break;
+				}
+			}
+			if (shared != 0) {
+				binding.variable_id = shared;
+				continue; // one variable, one interface entry, one set of annotations
+			}
+		}
 		binding.variable_id = state.builder.AllocateId();
 		state.interface_variables.push_back(binding.variable_id);
 	}
@@ -245,7 +269,15 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 			    {OpDecorate, state.subgroup_local_invocation_id_variable, DecorationFlat});
 		}
 	}
+	std::vector<uint32_t> annotated_inputs;
 	for (const auto& input: state.inputs) {
+		// Slots sharing a variable (see AllocateInputVariables) must be named and
+		// decorated exactly once.
+		if (std::find(annotated_inputs.begin(), annotated_inputs.end(), input.variable_id) !=
+		    annotated_inputs.end()) {
+			continue;
+		}
+		annotated_inputs.push_back(input.variable_id);
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
 		if (input.kind == IR::StageInputKind::Parameter) {
 			const auto flat = PixelParameterIsFlat(state, input.location);
@@ -258,6 +290,15 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 				    {OpDecorate, input.variable_id, DecorationNoPerspective});
 			}
 			const auto location = PixelParameterLocation(state, input.location);
+			if (state.stage == ShaderType::Pixel) {
+				// Muro 31 probe: show which input slot ends up on which SPIR-V location,
+				// and whether the fallback path invented it (mapped != final).
+				std::fprintf(stderr,
+				             "ps-input-loc: attr=%u mapped=%u final=%u components=%u kind=%u\n",
+				             input.location, PixelParameterMappedLocation(state, input.location),
+				             location, input.component_count,
+				             static_cast<uint32_t>(input.kind));
+			}
 			state.builder.AddAnnotation(
 			    {OpDecorate, input.variable_id, DecorationLocation, location});
 			continue;
@@ -574,7 +615,14 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		state.builder.AddType({OpVariable, state.ptr_input_uint,
 		                       state.subgroup_local_invocation_id_variable, StorageClassInput});
 	}
+	std::vector<uint32_t> declared_inputs;
 	for (const auto& input: state.inputs) {
+		// Slots sharing a variable (see AllocateInputVariables) declare it once.
+		if (std::find(declared_inputs.begin(), declared_inputs.end(), input.variable_id) !=
+		    declared_inputs.end()) {
+			continue;
+		}
+		declared_inputs.push_back(input.variable_id);
 		uint32_t ptr_type = state.ptr_input_uint;
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:

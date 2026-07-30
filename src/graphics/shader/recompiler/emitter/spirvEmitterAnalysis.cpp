@@ -15,6 +15,24 @@ uint32_t PixelParameterMappedLocation(const EmitterState& state, uint32_t attr) 
 	return ps->interpolator_settings[attr] & PsInputOffsetMask;
 }
 
+bool PixelParameterSharesEarlierVariable(const EmitterState& state, const InputBinding& input) {
+	if (state.stage != ShaderType::Pixel || input.kind != IR::StageInputKind::Parameter) {
+		return false;
+	}
+	const auto mapped = PixelParameterMappedLocation(state, input.location);
+	for (const auto& other: state.inputs) {
+		if (&other == &input) {
+			break;
+		}
+		if (other.kind == IR::StageInputKind::Parameter &&
+		    other.component_count == input.component_count &&
+		    PixelParameterMappedLocation(state, other.location) == mapped) {
+			return true;
+		}
+	}
+	return false;
+}
+
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
 	bool used_locations[32] = {};
 
@@ -23,8 +41,14 @@ uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
 			continue;
 		}
 
+		// An input that reuses an earlier input's variable (two PS slots aimed at the
+		// same vertex export) declares no location of its own, so it must not reserve
+		// one either: doing so pushed the NEXT slot onto a fallback location the vertex
+		// shader never writes, which Metal rejects (muro 31).
+		const bool shares = PixelParameterSharesEarlierVariable(state, input);
+
 		auto location = PixelParameterMappedLocation(state, input.location);
-		if (location < std::size(used_locations) && used_locations[location]) {
+		if (!shares && location < std::size(used_locations) && used_locations[location]) {
 			auto fallback_location = input.location;
 			while (fallback_location < std::size(used_locations) &&
 			       used_locations[fallback_location]) {
@@ -38,7 +62,7 @@ uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
 			return location;
 		}
 
-		if (location < std::size(used_locations)) {
+		if (!shares && location < std::size(used_locations)) {
 			used_locations[location] = true;
 		}
 	}

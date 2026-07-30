@@ -563,6 +563,7 @@ struct F16Class {
 
 uint32_t PixelParameterMappedLocation(const EmitterState& state, uint32_t attr);
 
+bool     PixelParameterSharesEarlierVariable(const EmitterState& state, const InputBinding& input);
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr);
 
 bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr);
