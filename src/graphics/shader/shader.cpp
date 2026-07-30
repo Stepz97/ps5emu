@@ -836,6 +836,19 @@ static void ShaderGetStaticInputInfoPS(
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
+		// Muro 31 probe: only OFFSET (bits 0-4) and FLAT_SHADE (bit 10) are interpreted
+		// today. DEFAULT_VAL (bits 8-9) — how real hardware feeds a PS input its VS never
+		// exports, which is what MoltenVK rejects — is dropped. Dump the raw word once
+		// per distinct value so the mapping can be reconstructed from a boot log.
+		{
+			static std::atomic_uint32_t seen[32] {};
+			const auto                  raw = sh.ps_interpolator_settings[i];
+			if (i < 32 && seen[i].exchange(raw) != raw) {
+				std::fprintf(stderr, "ps-input-cntl[%u] raw=0x%08x offset=%u default_val=%u "
+				                     "flat=%u\n",
+				             i, raw, raw & 0x1fu, (raw >> 8u) & 0x3u, (raw >> 10u) & 0x1u);
+			}
+		}
 	}
 
 	ps_info.descriptor_set =

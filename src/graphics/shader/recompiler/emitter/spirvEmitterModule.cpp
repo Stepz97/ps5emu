@@ -290,15 +290,6 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 				    {OpDecorate, input.variable_id, DecorationNoPerspective});
 			}
 			const auto location = PixelParameterLocation(state, input.location);
-			if (state.stage == ShaderType::Pixel) {
-				// Muro 31 probe: show which input slot ends up on which SPIR-V location,
-				// and whether the fallback path invented it (mapped != final).
-				std::fprintf(stderr,
-				             "ps-input-loc: attr=%u mapped=%u final=%u components=%u kind=%u\n",
-				             input.location, PixelParameterMappedLocation(state, input.location),
-				             location, input.component_count,
-				             static_cast<uint32_t>(input.kind));
-			}
 			state.builder.AddAnnotation(
 			    {OpDecorate, input.variable_id, DecorationLocation, location});
 			continue;
