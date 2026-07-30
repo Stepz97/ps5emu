@@ -1018,6 +1018,7 @@ bool IsScalarSaveexecOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
 		case Decoder::Opcode::SAndSaveexecB32:
 		case Decoder::Opcode::SAndn1SaveexecB32:
+		case Decoder::Opcode::SOrn2SaveexecB32:
 		case Decoder::Opcode::SAndSaveexecB64:
 		case Decoder::Opcode::SOrn2SaveexecB64:
 		case Decoder::Opcode::SAndn1SaveexecB64: return true;
@@ -1027,6 +1028,7 @@ bool IsScalarSaveexecOpcode(Decoder::Opcode opcode) {
 
 SaveexecMode ScalarSaveexecMode(Decoder::Opcode opcode) {
 	switch (opcode) {
+		case Decoder::Opcode::SOrn2SaveexecB32:
 		case Decoder::Opcode::SOrn2SaveexecB64: return SaveexecMode::Orn2;
 		case Decoder::Opcode::SAndn1SaveexecB32:
 		case Decoder::Opcode::SAndn1SaveexecB64: return SaveexecMode::Andn1;
@@ -1039,7 +1041,8 @@ bool LowerScalarSaveexec(const Decoder::Instruction& decoded, BasicBlock& block,
 	Instruction inst;
 	inst.pc            = decoded.pc;
 	inst.op            = (decoded.opcode == Decoder::Opcode::SAndSaveexecB32 ||
-	                      decoded.opcode == Decoder::Opcode::SAndn1SaveexecB32)
+	                      decoded.opcode == Decoder::Opcode::SAndn1SaveexecB32 ||
+	                      decoded.opcode == Decoder::Opcode::SOrn2SaveexecB32)
 	                         ? Opcode::SaveexecB32
 	                         : Opcode::SaveexecB64;
 	inst.saveexec_mode = ScalarSaveexecMode(decoded.opcode);
