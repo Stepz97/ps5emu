@@ -233,8 +233,17 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	    image.info.resources.layers % 6u == 0 &&
 	    static_cast<uint32_t>(descriptor.Depth()) + 1u == image.info.resources.layers &&
 	    descriptor.BaseArray5() == 0;
+	// A layered depth array is how a game samples shadow cascades: Astro Bot binds 16
+	// layers with depth compare (muro 37). ResolveTargetTextureView already builds the
+	// e2DArray view for exactly this descriptor, so only this gate stood in the way -
+	// the single-layer and cube shapes above simply never covered it.
+	const bool supported_layered_array =
+	    type == Prospero::ImageType::kColor2DArray && image.info.resources.layers > 1 &&
+	    static_cast<uint32_t>(descriptor.Depth()) + 1u == image.info.resources.layers &&
+	    descriptor.BaseArray5() == 0;
 	return image.info.IsDepth() && width == image.info.extent.width &&
-	       height == image.info.extent.height && (supported_single_layer || supported_cube) &&
+	       height == image.info.extent.height &&
+	       (supported_single_layer || supported_cube || supported_layered_array) &&
 	       descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 && descriptor.MaxMip() == 0 &&
 	       descriptor.MinLod() == 0 && descriptor.BaseArray5() == 0 &&
 	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
