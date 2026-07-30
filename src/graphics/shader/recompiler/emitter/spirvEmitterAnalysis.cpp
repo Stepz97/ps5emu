@@ -417,7 +417,7 @@ bool ProgramNeedsSubgroupBallot(const IR::Program& program) {
 	if (program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation) {
 		for (const auto& block: program.blocks) {
 			for (const auto& inst: block.instructions) {
-				if (inst.op == IR::Opcode::WqmB64) {
+				if (inst.op == IR::Opcode::WqmB64 || inst.op == IR::Opcode::WqmB32) {
 					return true;
 				}
 			}
@@ -532,7 +532,8 @@ bool IsCompareOpcode(IR::Opcode op) {
 bool ProgramNeedsSubgroupLocalInvocationId(const IR::Program& program) {
 	for (const auto& block: program.blocks) {
 		for (const auto& inst: block.instructions) {
-			if (inst.op == IR::Opcode::WqmB64 || inst.op == IR::Opcode::DsSwizzleB32 ||
+			if (inst.op == IR::Opcode::WqmB64 || inst.op == IR::Opcode::WqmB32 ||
+			    inst.op == IR::Opcode::DsSwizzleB32 ||
 			    inst.op == IR::Opcode::DsConsume || inst.op == IR::Opcode::DsAppend ||
 			    inst.op == IR::Opcode::WriteLaneU32 || inst.op == IR::Opcode::Permlane16B32 ||
 			    inst.op == IR::Opcode::Permlanex16B32 || inst.op == IR::Opcode::Export ||

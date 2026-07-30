@@ -24,6 +24,7 @@ enum class Opcode {
 	MoveRelDestU32,
 	MoveRelSourceU32,
 	MoveU64,
+	WqmB32,
 	WqmB64,
 	SaveexecB32,
 	SaveexecB64,

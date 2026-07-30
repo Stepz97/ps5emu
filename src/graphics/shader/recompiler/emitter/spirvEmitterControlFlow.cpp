@@ -377,6 +377,7 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::MoveRelDestU32: EmitMoveRelDestU32(state, inst); break;
 		case IR::Opcode::MoveRelSourceU32: EmitMoveRelSourceU32(state, inst); break;
 		case IR::Opcode::MoveU64: EmitMoveU64(state, inst); break;
+		case IR::Opcode::WqmB32: EmitWqmB32(state, inst); break;
 		case IR::Opcode::WqmB64: EmitWqmB64(state, inst); break;
 		case IR::Opcode::SaveexecB32: EmitSaveexecB32(state, inst); break;
 		case IR::Opcode::SaveexecB64: EmitSaveexecB64(state, inst); break;

@@ -1109,6 +1109,7 @@ void EmitMoveU64(EmitterState& state, const IR::Instruction& inst);
 
 uint32_t EmitWqmLaneU32(EmitterState& state, uint32_t src);
 
+void EmitWqmB32(EmitterState& state, const IR::Instruction& inst);
 void EmitWqmB64(EmitterState& state, const IR::Instruction& inst);
 
 void EmitSaveexecB32(EmitterState& state, const IR::Instruction& inst);
