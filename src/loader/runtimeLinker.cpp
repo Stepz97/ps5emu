@@ -813,6 +813,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        info->access_violation_vaddr)) {
 			return true;
 		}
+
+		// A guest INT 0x41 (SDK debug break) surfaces as a general protection fault, which
+		// the kernel reports as a write access violation at address 0. Retail consoles
+		// swallow it, so step over it here instead of dying (muro 27).
+		if (info->access_violation_vaddr == 0 &&
+		    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+			return true;
+		}
 	}
 
 	LOGF("kyty_exception_handler: %016" PRIx64 "\n", info->exception_address);
