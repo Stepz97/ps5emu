@@ -5,6 +5,8 @@
 #include "loader/symbolDatabase.h"
 
 #include <cstring>
+#include <algorithm>
+#include <array>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -576,9 +578,30 @@ static void KYTY_SYSV_ABI JsonValueDtor(void* self) {
 	JsonValueClear(reinterpret_cast<JsonValue*>(self));
 }
 
+// Muro 27 probe plumbing: nodes that referValue had to CREATE are watched through
+// their whole life (assign / type query) so a failed write shows up in the log.
+static std::array<const JsonValue*, 8> g_watched_nodes {};
+static size_t                          g_watched_next = 0;
+
+static void JsonWatchNode(const JsonValue* node) {
+	g_watched_nodes[g_watched_next] = node;
+	g_watched_next                  = (g_watched_next + 1) % g_watched_nodes.size();
+}
+
+static bool JsonIsWatched(const JsonValue* node) {
+	return node != nullptr &&
+	       std::find(g_watched_nodes.begin(), g_watched_nodes.end(), node) !=
+	           g_watched_nodes.end();
+}
+
 static JsonValue* KYTY_SYSV_ABI JsonValueAssign(JsonValue* self, const JsonValue* src) {
 	PRINT_NAME();
 
+	if (JsonIsWatched(self)) {
+		std::fprintf(stderr, "json-watch-assign: node=%p src_type=%u\n",
+		             static_cast<const void*>(self),
+		             src != nullptr ? src->type : 0xffffffffu);
+	}
 	JsonValueCopy(self, src);
 	return self;
 }
@@ -652,6 +675,10 @@ static void KYTY_SYSV_ABI JsonValueSetType(JsonValue* self, uint32_t type) {
 static uint32_t KYTY_SYSV_ABI JsonValueGetType(const JsonValue* self) {
 	PRINT_NAME();
 
+	if (JsonIsWatched(self)) {
+		std::fprintf(stderr, "json-watch-type: node=%p type=%u\n",
+		             static_cast<const void*>(self), self->type);
+	}
 	return (self != nullptr ? self->type : JsonValueTypeNull);
 }
 
@@ -768,7 +795,8 @@ static JsonValue* KYTY_SYSV_ABI JsonValueReferValue(JsonValue* self, const JsonS
 	if (self == nullptr) {
 		return JsonStaticNullValue();
 	}
-	if (self->type == JsonValueTypeNull) {
+	const bool promoted = self->type == JsonValueTypeNull;
+	if (promoted) {
 		self->type   = JsonValueTypeObject;
 		self->object = JsonObjectNew();
 	}
@@ -776,7 +804,33 @@ static JsonValue* KYTY_SYSV_ABI JsonValueReferValue(JsonValue* self, const JsonS
 		return JsonStaticNullValue();
 	}
 	const auto* key_impl = JsonStringImpl(key);
-	return JsonObjectLookup(self->object, key_impl != nullptr ? *key_impl : std::string(), true);
+	const auto& key_str  = key_impl != nullptr ? *key_impl : std::string();
+	// Muro 27 probe: a key referValue has to CREATE is data the game expected to
+	// exist — the prime suspect for the boolean-type assert in Network/Json.cpp.
+	const bool miss   = JsonObjectLookup(self->object, key_str, false) == JsonStaticNullValue();
+	auto*      result = JsonObjectLookup(self->object, key_str, true);
+	if (miss) {
+		JsonWatchNode(result);
+		// Sibling keys identify which document the game thinks it is reading.
+		std::string siblings;
+		for (const auto& item: *JsonObjectImpl(self->object)) {
+			if (item.first == key_str) {
+				continue;
+			}
+			if (!siblings.empty()) {
+				siblings.push_back(',');
+			}
+			siblings.append(item.first);
+			if (siblings.size() > 200) {
+				siblings.append(",...");
+				break;
+			}
+		}
+		std::fprintf(stderr, "json-refer-miss: key=%s node=%p promoted=%d siblings=[%s]\n",
+		             key_str.c_str(), static_cast<const void*>(result), promoted ? 1 : 0,
+		             siblings.c_str());
+	}
+	return result;
 }
 
 static JsonString* KYTY_SYSV_ABI JsonStringCtor(JsonString* self) {
@@ -927,10 +981,17 @@ static int32_t KYTY_SYSV_ABI JsonParserParse(JsonValue* dst, const char* src, si
 	JsonValue parsed {};
 	JsonValueInit(&parsed);
 	auto json = nlohmann::json::parse(src, src + size, nullptr, false);
+	// The guest never promises a null terminator inside src (parse gets an explicit
+	// range for the same reason), so the probes bound the printed head by size.
+	const auto head_len = static_cast<int>(std::min<size_t>(size, 120));
 	if (json.is_discarded() || !JsonValueFromNlohmann(&parsed, json)) {
 		JsonValueClear(&parsed);
+		std::fprintf(stderr, "json-parse-fail: size=%zu head=%.*s\n", size, head_len, src);
 		return JSON_ERROR_PARSE_INVALID_CHAR;
 	}
+	// Muro 27 probe: identify which documents the Network module walks before its
+	// boolean-type assert. One line per parse, head only.
+	std::fprintf(stderr, "json-parse: size=%zu head=%.*s\n", size, head_len, src);
 
 	JsonValueCopy(dst, &parsed);
 	JsonValueClear(&parsed);
@@ -946,6 +1007,20 @@ static int32_t KYTY_SYSV_ABI JsonInitializerSetGlobalNullAccessCallback(void* se
 	     "\t context  = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(self), reinterpret_cast<uint64_t>(callback),
 	     reinterpret_cast<uint64_t>(context));
+
+	// Muro 27 probe: the guest callback (disassembled) just returns context + a
+	// per-type offset, i.e. context points at a table of default Values. Dump it.
+	if (context != nullptr) {
+		static const uint64_t offsets[] = {0x8, 0x28, 0x48, 0x68, 0x88, 0xa8};
+		for (auto offset: offsets) {
+			const auto* value = reinterpret_cast<const JsonValue*>(
+			    reinterpret_cast<const uint8_t*>(context) + offset);
+			std::fprintf(stderr,
+			             "json-null-default: +0x%02llx type=%u raw=0x%016llx\n",
+			             static_cast<unsigned long long>(offset), value->type,
+			             static_cast<unsigned long long>(value->uinteger));
+		}
+	}
 
 	return 0;
 }
