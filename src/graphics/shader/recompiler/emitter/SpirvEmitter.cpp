@@ -466,9 +466,17 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.reachable_blocks.reserve(InitialEmitterVectorReserve);
 	CollectRegisters(program, state.registers);
 	CopyProgramInputsAndOutputs(state, program);
-	state.needs_subgroup_ballot              = ProgramNeedsSubgroupBallot(program);
-	state.needs_subgroup_shuffle             = ProgramNeedsSubgroupShuffle(program);
-	state.needs_subgroup_local_invocation_id = ProgramNeedsSubgroupLocalInvocationId(program);
+#if defined(__APPLE__)
+	// Muro 32: Metal rejects any simdgroup query inside a vertex function, so a vertex
+	// stage that needs ballot/shuffle produces a pipeline that never compiles. Emulate
+	// the guest wave as a single lane there instead — cross-lane reads degrade, but the
+	// alternative is no rendering at all. Other stages keep the real subgroup ops.
+	state.single_lane_subgroup = state.stage == ShaderType::Vertex;
+#endif
+	state.needs_subgroup_ballot  = !state.single_lane_subgroup && ProgramNeedsSubgroupBallot(program);
+	state.needs_subgroup_shuffle = !state.single_lane_subgroup && ProgramNeedsSubgroupShuffle(program);
+	state.needs_subgroup_local_invocation_id =
+	    !state.single_lane_subgroup && ProgramNeedsSubgroupLocalInvocationId(program);
 	state.needs_compute_derivatives          = ProgramNeedsComputeDerivatives(program);
 	state.needs_image_gather_extended        = ProgramNeedsImageGatherExtended(program);
 	state.needs_function_lds                 = ProgramNeedsFunctionLds(program);

@@ -1499,6 +1499,15 @@ struct ExecMaskInfo {
 ExecMaskInfo EmitExecMaskInfo(EmitterState& state) {
 	uint32_t exec_lo = 0;
 	uint32_t exec_hi = 0;
+	if (state.single_lane_subgroup) {
+		// One-lane wave: this invocation is lane 0, and the whole mask is its own EXEC
+		// bit — so the active count is 1 or 0 and the first active lane is always 0.
+		const auto active = EmitExecActiveBool(state);
+		const auto count  = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelect, state.uint_type, count, active,
+		                           ConstantU32(state, 1), ConstantU32(state, 0)});
+		return {count, ConstantU32(state, 0), active};
+	}
 	if (state.per_invocation_masks) {
 		const auto ballot = state.builder.AllocateId();
 		state.builder.AddFunction({OpGroupNonUniformBallot, state.vec4_uint_type, ballot,
@@ -1572,9 +1581,14 @@ void EmitDsAppendConsume(EmitterState& state, const IR::Instruction& inst, uint3
 		}
 		return result;
 	});
-	const auto broadcast    = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, broadcast,
-	                            ConstantU32(state, ScopeSubgroup), atomic_value, exec.first_lane});
+	// A one-lane wave broadcasts to itself, so the shuffle collapses to the value.
+	uint32_t broadcast = atomic_value;
+	if (!state.single_lane_subgroup) {
+		broadcast = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, broadcast,
+		                            ConstantU32(state, ScopeSubgroup), atomic_value,
+		                            exec.first_lane});
+	}
 	const auto value = EmitSelectU32Value(state, exec.any_active, broadcast, ConstantU32(state, 0));
 	EmitStoreU32(state, inst.dst, value);
 }
@@ -1665,9 +1679,13 @@ void EmitDsSwizzleB32(EmitterState& state, const IR::Instruction& inst) {
 	const auto control = inst.src_count > 1u ? inst.src[1].imm & 0xffffu : 0u;
 	const auto subid   = EmitSubgroupLocalInvocationId(state);
 	const auto target  = EmitDsSwizzleTargetLane(state, subid, control);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, value,
-	                            ConstantU32(state, ScopeSubgroup), source, target});
+	// A one-lane wave can only swizzle from itself.
+	uint32_t value = source;
+	if (!state.single_lane_subgroup) {
+		value = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, value,
+		                            ConstantU32(state, ScopeSubgroup), source, target});
+	}
 	const auto exec_active     = EmitLaneIndexActiveBool(state, target);
 	const auto subgroup_active = EmitSubgroupLaneActiveBool(state, target);
 	const auto source_active   = state.builder.AllocateId();

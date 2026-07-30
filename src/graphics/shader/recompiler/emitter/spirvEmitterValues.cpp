@@ -168,7 +168,12 @@ uint32_t EmitDppValueU32(EmitterState& state, const IR::Operand& operand, uint32
 		return value;
 	}
 
-	const auto target   = EmitDppTargetLane(state, operand.dpp_ctrl);
+	const auto target = EmitDppTargetLane(state, operand.dpp_ctrl);
+	if (state.single_lane_subgroup) {
+		// A one-lane wave can only ever read its own value, so the cross-lane fetch
+		// collapses to the source operand (see single_lane_subgroup).
+		return value;
+	}
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, shuffled,
 	                           ConstantU32(state, ScopeSubgroup), value, target.lane});
@@ -646,6 +651,15 @@ uint32_t EmitLaneMaskOperandActiveBool(EmitterState& state, const IR::Operand& o
 }
 
 uint32_t EmitLaneIndexActiveBool(EmitterState& state, uint32_t lane) {
+	if (state.single_lane_subgroup) {
+		// One-lane wave: only lane 0 exists, and it is active when EXEC says so.
+		const auto is_self = state.builder.AllocateId();
+		const auto ret     = state.builder.AllocateId();
+		state.builder.AddFunction({OpIEqual, state.bool_type, is_self, lane, ConstantU32(state, 0)});
+		state.builder.AddFunction(
+		    {OpLogicalAnd, state.bool_type, ret, is_self, EmitExecActiveBool(state)});
+		return ret;
+	}
 	if (state.per_invocation_masks) {
 		const auto ballot = state.builder.AllocateId();
 		state.builder.AddFunction({OpGroupNonUniformBallot, state.vec4_uint_type, ballot,
@@ -678,6 +692,11 @@ uint32_t EmitLaneIndexActiveBool(EmitterState& state, uint32_t lane) {
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
+	if (state.single_lane_subgroup) {
+		const auto ret = state.builder.AllocateId();
+		state.builder.AddFunction({OpIEqual, state.bool_type, ret, lane, ConstantU32(state, 0)});
+		return ret;
+	}
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, state.vec4_uint_type, active_ballot,
 	                           ConstantU32(state, ScopeSubgroup), EmitTrueBool(state)});

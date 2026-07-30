@@ -322,6 +322,10 @@ struct EmitterState {
 	uint32_t                               wave_size                    = 64;
 	bool                                   exact_subgroup_operations    = false;
 	bool                                   per_invocation_masks         = false;
+	// Metal forbids simdgroup queries inside vertex functions, so a vertex stage that
+	// asks for ballot/shuffle fails to compile at all. Emulate the guest wave as a
+	// single lane there: strictly better than a pipeline that never builds.
+	bool                                   single_lane_subgroup         = false;
 	uint32_t                               void_type                    = 0;
 	uint32_t                               bool_type                    = 0;
 	uint32_t                               uint_type                    = 0;

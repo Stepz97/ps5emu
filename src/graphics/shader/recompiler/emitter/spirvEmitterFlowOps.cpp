@@ -110,8 +110,11 @@ uint32_t EmitWqmLaneU32(EmitterState& state, uint32_t src) {
 }
 
 void EmitWqmB64(EmitterState& state, const IR::Instruction& inst) {
-	if (!state.per_invocation_masks && inst.dst.kind == IR::OperandKind::Register &&
+	if ((state.single_lane_subgroup || !state.per_invocation_masks) &&
+	    inst.dst.kind == IR::OperandKind::Register &&
 	    inst.dst.reg.file == IR::RegisterFile::Scalar) {
+		// The lane-local path needs no ballot, which is the only option for a one-lane
+		// wave (see single_lane_subgroup).
 		const auto low      = EmitSequentialValueLoad(state, inst.src[0], 0);
 		const auto high     = EmitSequentialValueLoad(state, inst.src[0], 1);
 		const auto ret_low  = EmitWqmLaneU32(state, low);
@@ -264,6 +267,11 @@ void EmitSaveexecB64(EmitterState& state, const IR::Instruction& inst) {
 
 void EmitReadFirstLaneU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto src         = EmitValueLoad(state, inst.src[0]);
+	if (state.single_lane_subgroup) {
+		// This invocation is the only lane, so it is also the first one.
+		EmitStoreU32(state, inst.dst, src);
+		return;
+	}
 	const auto active      = EmitExecActiveBool(state);
 	const auto ballot      = state.builder.AllocateId();
 	const auto first_lane  = state.builder.AllocateId();
@@ -349,6 +357,11 @@ void EmitPermlaneB32(EmitterState& state, const IR::Instruction& inst, bool x16)
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, state.uint_type, index1, index0, ConstantU32(state, 15)});
 	state.builder.AddFunction({OpBitwiseOr, state.uint_type, target, row_value, index1});
+	if (state.single_lane_subgroup) {
+		// A one-lane wave permutes only its own value.
+		EmitStoreU32(state, inst.dst, value);
+		return;
+	}
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, shuffled,
 	                            ConstantU32(state, ScopeSubgroup), value, target});
 	uint32_t ret = shuffled;
