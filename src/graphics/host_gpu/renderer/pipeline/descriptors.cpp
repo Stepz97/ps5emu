@@ -569,11 +569,11 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		return {id, nullptr, std::move(desc)};
 	}
 
-	const auto address    = descriptor.Base40();
-	const auto width      = static_cast<uint32_t>(descriptor.Width5()) + 1u;
-	const auto height     = static_cast<uint32_t>(descriptor.Height5()) + 1u;
-	const auto base_level = descriptor.BaseLevel();
-	const auto last_level = descriptor.LastLevel();
+	const auto address = descriptor.Base40();
+	const auto width   = static_cast<uint32_t>(descriptor.Width5()) + 1u;
+	const auto height  = static_cast<uint32_t>(descriptor.Height5()) + 1u;
+	auto       base_level = static_cast<uint32_t>(descriptor.BaseLevel());
+	auto       last_level = static_cast<uint32_t>(descriptor.LastLevel());
 	const auto type       = TextureType(descriptor);
 	const bool multisampled =
 	    type == Prospero::ImageType::kColor2DMsaa || type == Prospero::ImageType::kColor2DMsaaArray;
@@ -581,7 +581,16 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	const auto tile       = descriptor.TileMode();
 	const bool msaa_tile  = tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
-	if ((!multisampled && (base_level > last_level || last_level >= levels)) ||
+	// Real descriptors can be self-inconsistent: Astro Bot binds base=last=6 on a
+	// MaxMip=5 texture (muro 23). Hardware tolerates the out-of-range level by reading
+	// the clamped mip, so mirror that instead of rejecting the whole bind.
+	if (!multisampled && levels != 0 && last_level >= levels) {
+		LOGF("texture mip view clamped: base=%u last=%u levels=%u\n", base_level, last_level,
+		     levels);
+		last_level = levels - 1u;
+		base_level = std::min(base_level, last_level);
+	}
+	if ((!multisampled && base_level > last_level) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 ||
 	      descriptor.MaxMip() != last_level || !msaa_tile || descriptor.MsaaDepth() ||
