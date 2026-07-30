@@ -1034,7 +1034,17 @@ KYTY_SUBSYSTEM_INIT(Memory) {
 
 	VirtualMemory::Init();
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Windows note: the placeholder machinery routes FIXED guest mappings through
+	// QueryReservedHostAllocation(), which requires the target range to sit inside a
+	// pre-existing MEM_RESERVE container it can release and carve. Nothing reserved the
+	// guest heap range on Windows (this block used to be Apple-only), so the very first
+	// fixed sceKernelMapNamedDirectMemory() of a real title died with
+	// placeholder-reserve-failed at 0x300000000 - the exact failure the block below was
+	// born to fix on macOS. Only the heap range is claimed here on Windows: module code
+	// loading demonstrably works without a reservation there, and a plain MEM_RESERVE
+	// container could break any loader path that does its own fixed VirtualAlloc.
+	//
 	// Under Rosetta 2 on Apple Silicon, macOS lacks MAP_FIXED_NOREPLACE, so
 	// ReserveFixedHostRange()/SysVirtualReserveFixed() are check-then-act: they probe with
 	// is_mapped() and then mmap(MAP_FIXED), which can lose the race to whatever else maps into
@@ -1092,10 +1102,12 @@ KYTY_SUBSYSTEM_INIT(Memory) {
 	constexpr uint64_t HEAP_RESERVED_MIN = 0x300000000ull; // 12 GiB: observed "orbis_user_malloc"
 	                                                       // sceKernelMapNamedDirectMemory() start
 	constexpr uint64_t HEAP_RESERVED_MAX = 0x379800000ull; // ~13.95 GiB: observed end of that range
-	constexpr uint64_t CODE_RESERVED_MIN = 0x900000000ull; // 36 GiB: SYSTEM_RESERVED +
-	                                                       // CODE_BASE_OFFSET (runtimeLinker.cpp)
-	constexpr uint64_t CODE_RESERVED_MAX = 0xb00000000ull; // 44 GiB: 8 GiB headroom for multiple
-	                                                       // modules (32x CODE_BASE_INCR)
+	[[maybe_unused]] constexpr uint64_t CODE_RESERVED_MIN = 0x900000000ull; // 36 GiB:
+	                                                       // SYSTEM_RESERVED + CODE_BASE_OFFSET
+	                                                       // (runtimeLinker.cpp)
+	[[maybe_unused]] constexpr uint64_t CODE_RESERVED_MAX = 0xb00000000ull; // 44 GiB: 8 GiB
+	                                                       // headroom for multiple modules
+	                                                       // (32x CODE_BASE_INCR)
 
 	auto reserve_range_best_effort = [RESERVE_CHUNK_SIZE](uint64_t range_min, uint64_t range_max,
 	                                                      const char* label) {
@@ -1135,7 +1147,9 @@ KYTY_SUBSYSTEM_INIT(Memory) {
 	};
 
 	reserve_range_best_effort(HEAP_RESERVED_MIN, HEAP_RESERVED_MAX, "heap");
+#if defined(__APPLE__)
 	reserve_range_best_effort(CODE_RESERVED_MIN, CODE_RESERVED_MAX, "code");
+#endif
 #endif
 
 	g_direct_memory_backing     = new DirectMemoryBacking(PhysicalMemory::Size());

@@ -247,6 +247,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 int main(int argc, char* argv[]) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Diagnostics only: a crash used to truncate the tail of a redirected log, hiding the
+	// very frames that explain it. Unbuffered stdout costs throughput but never lies.
+	setvbuf(stdout, nullptr, _IONBF, 0);
+	setvbuf(stderr, nullptr, _IONBF, 0);
+#endif
 #if defined(__APPLE__)
 	// Darwin-only diagnostic left from the muro-18 stack work; pthread_get_stackaddr_np
 	// does not exist elsewhere.

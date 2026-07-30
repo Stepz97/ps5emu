@@ -44,8 +44,18 @@ public:
 			           static_cast<uint32_t>(GetLastError()));
 			return;
 		}
+		// A hint-less ~14 GiB alias was observed landing across the guest's fixed-address
+		// band (host-committed pages at 0x400000000 broke the GpuOnionMemory fixed map:
+		// mapped views cannot be decommitted by any guest-side replace path). Pin the
+		// alias above HOST_USER_MAX so it can never collide with a guest-reachable
+		// address; fall back to a hint-less view only if that address is taken.
 		m_backing_base = static_cast<uint8_t*>(
-		    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		    MapViewOfFileEx(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size,
+		                    reinterpret_cast<void*>(0x10000000000ull)));
+		if (m_backing_base == nullptr) {
+			m_backing_base = static_cast<uint8_t*>(
+			    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		}
 		if (m_backing_base == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t direct-memory backing: writable alias failed: 0x%08" PRIx32 "\n",
@@ -227,6 +237,31 @@ public:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (mapped == nullptr && ReleaseExactHostAllocation(vaddr, size)) {
 			mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
+		}
+		if (mapped == nullptr) {
+			// A fixed mapping into entirely FREE address space has no placeholder to
+			// replace and no reserved container to carve - MapView can never succeed
+			// there. Create the placeholder on the spot at the exact address and take
+			// the normal replace path, keeping every placeholder invariant intact.
+			// Harmlessly fails (and falls through) when the range is not actually free.
+			// Windows rounds an unaligned hint down to allocation granularity (64 KiB)
+			// while guest pages are 16 KiB, so the placeholder can land below vaddr.
+			// Keep the returned base: MEM_REPLACE_PLACEHOLDER needs an exact match, and
+			// MEM_RELEASE needs the real base to free anything at all.
+			void* placeholder =
+			    VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
+			                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+			if (placeholder != nullptr && reinterpret_cast<uint64_t>(placeholder) != vaddr) {
+				VirtualFree(placeholder, 0, MEM_RELEASE);
+				placeholder = nullptr;
+			}
+			if (placeholder != nullptr) {
+				mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode,
+				                                failure_reason);
+				if (mapped == nullptr) {
+					VirtualFree(placeholder, 0, MEM_RELEASE);
+				}
+			}
 		}
 		if (mapped == nullptr) {
 			ReleasedReservedHostAllocation released {};
@@ -668,6 +703,11 @@ private:
 			placeholder                        = reserve();
 		}
 		if (placeholder == nullptr) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t placeholder reserve failed: err=0x%08" PRIx32 " search=0x%016" PRIx64
+			           " aligned=0x%016" PRIx64 " size=0x%016" PRIx64 " align=0x%016" PRIx64 "\n",
+			           static_cast<uint32_t>(GetLastError()), search_addr, aligned_search, size,
+			           alignment);
 			SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
 			return 0;
 		}
