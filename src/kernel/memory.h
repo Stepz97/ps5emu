@@ -107,6 +107,9 @@ bool               TryWriteBacking(uint64_t vaddr, const void* data, uint64_t si
 bool               TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 void               WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void               InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Pull a GPU image back into guest memory (see GpuResourceManager). Used by scan-out
+// instrumentation, which otherwise reads a buffer the renderer never writes.
+bool               SynchronizeGpuImageToMemory(uint64_t vaddr, uint64_t size);
 void               InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 void               DumpGpuWatchedRanges(std::FILE* out) noexcept;

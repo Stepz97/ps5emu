@@ -156,6 +156,30 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+bool GpuResourceManager::SynchronizeImageToMemory(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size) || CommandScheduler::InDeferredOperation()) {
+		return false;
+	}
+	bool       synchronized = false;
+	const auto resolve      = [this, vaddr, size, &synchronized](CommandProcessor& cp) {
+        cp.BeginReadbackTransaction();
+        {
+            ResourceMutex::FaultScope fault(m_resource_mutex);
+            synchronized = m_texture_cache.SynchronizeImageToBuffer(vaddr, size);
+        }
+        cp.EndReadbackTransaction();
+	};
+	if (auto* cp = Gpu::CurrentCommandProcessor(); cp != nullptr) {
+		resolve(*cp);
+		return synchronized;
+	}
+	if (m_resource_mutex.IsOwnedByCurrentThread() || m_gpu == nullptr) {
+		return false;
+	}
+	m_gpu->SendCommandSyncWithProcessor(resolve);
+	return synchronized;
+}
+
 bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
