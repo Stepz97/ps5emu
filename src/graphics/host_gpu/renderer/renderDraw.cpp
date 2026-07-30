@@ -41,6 +41,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1028,6 +1029,38 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	RebindIndexBuffer(buffer, index_binding);
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
+
+	// scanout-probe: log the FIRST sighting of every color-target base address, to attribute
+	// which pass (if any) renders into the buffer the scan-out presents. Deduped so the hot
+	// path stays one set lookup; only active alongside --dump-scanout.
+	static const bool probe_enabled = !Config::GetDumpScanOutPath().empty();
+	if (probe_enabled) {
+		static Common::Mutex                probe_mutex;
+		static std::unordered_set<uint64_t> probe_seen;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto probe_addr = state.color_info[i].base_addr;
+			if (probe_addr == 0) {
+				continue;
+			}
+			bool first_sight = false;
+			{
+				Common::LockGuard probe_lock(probe_mutex);
+				first_sight = probe_seen.insert(probe_addr).second;
+			}
+			if (first_sight) {
+				const auto* ps_program =
+				    state.ps_active ? state.ps_input_info.stage.program.get() : nullptr;
+				LOGF("scanout-probe: draw color target base=0x%010" PRIx64 " slot=%u draw=%s"
+				     " index_count=%u ps=0x%016" PRIx64 " out_mode0=%u mrt_mask=0x%02" PRIx32
+				     " rt_mask=0x%08" PRIx32 "\n",
+				     probe_addr, i, draw.name, draw.index_count,
+				     ps_program != nullptr ? ps_program->shader_hash : 0,
+				     state.ps_input_info.target_output_mode[0],
+				     state.ps_input_info.mrt_output_mask,
+				     buffer.GetRegisters().GetRenderTargetMask());
+			}
+		}
+	}
 
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
