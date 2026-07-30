@@ -174,7 +174,11 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 		    // Astro Bot does it, and rejecting the whole render state cost us the frame
 		    // (muro 33). The stencil-specific validation below stays gated on
 		    // has_stencil, and the resolved target reports no stencil buffer.
-		    {"resummarize_enable", rc.resummarize_enable != 0},
+		    // DB_RENDER_CONTROL.RESUMMARIZE_ENABLE asks the hardware to recompute the
+		    // HTile min/max summary for the tiles it draws. It is a depth-compression
+		    // maintenance pass: the depth values themselves are unchanged, and this
+		    // renderer stores depth uncompressed, so there is no summary to rebuild and
+		    // honouring the bit is a no-op. Astro Bot sets it (muro 36).
 		    {"copy_centroid", rc.copy_centroid != 0},
 		    {"copy_sample", rc.copy_sample != 0},
 		    {"z expclear_enabled", z.z_info.expclear_enabled != 0},
