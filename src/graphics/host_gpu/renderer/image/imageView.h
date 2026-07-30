@@ -124,7 +124,14 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
 	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.written &&
-	       !resource.atomic && !resource.depth_compare;
+	       // Image atomics are a real storage-image operation, not an unsupported one: the
+	       // SPIR-V emitter already accepts them on StorageImageUint (they only exist on
+	       // integer formats, which the descriptor validator cross-checks). Vetoing them
+	       // here rejected the whole bind — muro 28, same shape as the sampled/storage
+	       // validators of muros 20-23.
+	       (!resource.atomic ||
+	        resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint) &&
+	       !resource.depth_compare;
 }
 
 inline void

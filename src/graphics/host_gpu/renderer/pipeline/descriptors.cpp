@@ -354,9 +354,16 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_tile = tile == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) ||
 	                            tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
 	                            supported_depth_tile || supported_standard_tile;
+	// A read storage texture normally has to be identity-swizzled, but a single-channel
+	// image legitimately declares the hardware's channel expansion (R,0,0,1) — which is
+	// exactly what a shader read of a one-component format returns anyway, and Vulkan
+	// ignores component mapping on storage views regardless. Astro Bot binds its R32
+	// atomic image that way (muro 29).
+	const bool single_channel_swizzle = descriptor.DstSelXYZW() == DstSel(4, 0, 0, 1);
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(descriptor.DstSelXYZW()) &&
-	    (descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) || !resource.read);
+	    (descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) || single_channel_swizzle ||
+	     !resource.read);
 	const bool supported_mip_view = descriptor.BaseLevel() == 0 || is_1d || is_2d;
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d) && supported_tile &&
 	       supported_mip_view &&
