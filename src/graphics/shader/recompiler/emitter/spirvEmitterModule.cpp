@@ -501,6 +501,28 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	}
 	if (state.needs_subgroup_ballot || state.needs_subgroup_shuffle ||
 	    state.needs_subgroup_local_invocation_id) {
+		// Muro 32 probe: Metal forbids simdgroup queries in vertex functions, so name
+		// which subgroup feature a graphics stage is asking for before it reaches the
+		// driver. One line per distinct combination.
+		if (state.stage != ShaderType::Compute) {
+			static std::atomic_uint32_t seen {0xffffffffu};
+			const auto combo = (static_cast<uint32_t>(state.stage) << 8u) |
+			                   (state.needs_subgroup_ballot ? 1u : 0u) |
+			                   (state.needs_subgroup_shuffle ? 2u : 0u) |
+			                   (state.needs_subgroup_local_invocation_id ? 4u : 0u) |
+			                   (state.exact_subgroup_operations ? 8u : 0u) |
+			                   (state.per_invocation_masks ? 16u : 0u);
+			if (seen.exchange(combo) != combo) {
+				std::fprintf(stderr,
+				             "subgroup-in-graphics: stage=%u ballot=%d shuffle=%d localid=%d "
+				             "exact=%d per_invocation=%d wave=%u\n",
+				             static_cast<uint32_t>(state.stage), state.needs_subgroup_ballot,
+				             state.needs_subgroup_shuffle,
+				             state.needs_subgroup_local_invocation_id,
+				             state.exact_subgroup_operations, state.per_invocation_masks,
+				             state.wave_size);
+			}
+		}
 		state.builder.AddCapability({CapabilityGroupNonUniform});
 	}
 	if (state.needs_subgroup_ballot) {
