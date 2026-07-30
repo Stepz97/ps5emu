@@ -870,12 +870,24 @@ bool LowerVInterpP1F32(const Decoder::Instruction& decoded, BasicBlock& block) {
 
 bool LowerVInterpLoadF32(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
+	// v_interp_mov_f32 moves a raw interpolation parameter: mode 2 is P0 (the attribute
+	// at provoking vertex), modes 0 and 1 are P10/P20, the per-vertex deltas a shader
+	// multiplies by the barycentrics to rebuild the value itself. This recompiler lets
+	// the rasterizer interpolate (v_interp_p1 is already a nop and LoadInputF32 yields
+	// the interpolated attribute), so the deltas must be zero: the guest's own
+	// P0 + P10*i + P20*j then evaluates to exactly the interpolated value. A shader
+	// using the deltas for anything else (screen-space gradients) would lose them.
 	if (decoded.opcode == Decoder::Opcode::VInterpMovF32 && decoded.src0.value != 2u) {
-		if (error != nullptr) {
-			*error = fmt::format("v_interp_mov_f32 mode {} is not implemented at pc 0x{:08x}",
-			                     decoded.src0.value, decoded.pc);
+		Instruction zero;
+		zero.pc        = decoded.pc;
+		zero.op        = Opcode::MoveU32;
+		zero.src_count = 1;
+		zero.src[0]    = MakeImmediateU32(0);
+		if (!LowerRegisterOperand(decoded.dst, zero.dst, error)) {
+			return false;
 		}
-		return false;
+		block.instructions.push_back(zero);
+		return true;
 	}
 
 	Instruction inst;
