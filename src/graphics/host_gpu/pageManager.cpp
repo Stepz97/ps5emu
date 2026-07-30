@@ -995,6 +995,16 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 					if (guard == nullptr || guard->write_watchers != 0 ||
 					    guard->access_watchers != 0 || guard->guard_state == GUARD_ARMED ||
 					    guard->resolving) {
+						// Residual probe (advisor finding): an arm attempt colliding with
+						// an in-flight resolution skips silently, and if that page ends
+						// its resolution unwatched the run keeps an unguarded writable
+						// edge — the split-store abort geometry. Log for correlation.
+						if (guard != nullptr && guard->resolving) {
+							std::fprintf(stderr,
+							             "guard-skip-resolving: 0x%016" PRIx64
+							             " (run base 0x%016" PRIx64 ")\n",
+							             guard_addr, chunk_begin + i * PAGE_SIZE);
+						}
 						continue;
 					}
 					if (MachQueryPageProt(guard_addr) != PAGE_READWRITE) {
