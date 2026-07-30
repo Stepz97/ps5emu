@@ -961,7 +961,13 @@ void CreatePipelineInternal(
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		// Naming the driver's verdict and the shaders involved turns a bare "not
+		// implemented" into an actionable report.
+		EXIT("graphics pipeline creation failed: result=%s VS=0x%08" PRIx32 "/0x%08" PRIx32
+		     " PS=0x%08" PRIx32 "/0x%08" PRIx32 "\n",
+		     VulkanToString(result).c_str(), vs_hash0, vs_crc32, ps_hash0, ps_crc32);
+	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 
