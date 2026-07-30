@@ -738,6 +738,47 @@ static int32_t KYTY_SYSV_ABI JsonValueSerialize(JsonValue* self, JsonString* dst
 	return 0;
 }
 
+// sce::Json::Value::toString(sce::Json::String&) const — a string value copies its
+// content, anything else serializes as raw JSON text (muro 26: Astro Bot walks its UI
+// animation config with toString/referValue pairs).
+static int32_t KYTY_SYSV_ABI JsonValueToString(const JsonValue* self, JsonString* dst) {
+	PRINT_NAME();
+
+	auto* impl = JsonStringImpl(dst);
+	if (impl == nullptr) {
+		return 0;
+	}
+	impl->clear();
+	if (self != nullptr && self->type == JsonValueTypeString) {
+		const auto* value = JsonStringImpl(self->string);
+		if (value != nullptr) {
+			*impl = *value;
+		}
+	} else {
+		JsonSerializeValue(self, impl);
+	}
+	return 0;
+}
+
+// sce::Json::Value::referValue(const sce::Json::String&) — mutable child lookup that
+// builds the tree on demand: a null node becomes an object, a missing key is created.
+static JsonValue* KYTY_SYSV_ABI JsonValueReferValue(JsonValue* self, const JsonString* key) {
+	PRINT_NAME();
+
+	if (self == nullptr) {
+		return JsonStaticNullValue();
+	}
+	if (self->type == JsonValueTypeNull) {
+		self->type   = JsonValueTypeObject;
+		self->object = JsonObjectNew();
+	}
+	if (self->type != JsonValueTypeObject) {
+		return JsonStaticNullValue();
+	}
+	const auto* key_impl = JsonStringImpl(key);
+	return JsonObjectLookup(self->object, key_impl != nullptr ? *key_impl : std::string(), true);
+}
+
 static JsonString* KYTY_SYSV_ABI JsonStringCtor(JsonString* self) {
 	PRINT_NAME();
 
@@ -958,6 +999,8 @@ LIB_DEFINE(InitNet_1_Json2) {
 	LIB_FUNC("urOpESTBZmo", LibJson2::JsonObjectAssign);
 	LIB_FUNC("zTwZdI8AZ5Y", LibJson2::JsonValueGetBoolean);
 	LIB_FUNC("R7FDWtcN6f8", LibJson2::JsonValueSerialize);
+	LIB_FUNC("Ncel8t2Rrpc", LibJson2::JsonValueToString);
+	LIB_FUNC("wLsJlmgEIaI", LibJson2::JsonValueReferValue);
 	LIB_FUNC("oH8aBmLU+fc", LibJson2::JsonObjectClear);
 	LIB_FUNC("bAM9Qwofus0", LibJson2::JsonArrayBack);
 	LIB_FUNC("UeuWT+yNdCQ", LibJson2::JsonValueBoolCtor);
