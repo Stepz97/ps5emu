@@ -2,6 +2,9 @@
 
 #include "common/common.h"
 
+#include <atomic>
+#include <cstdio>
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 #elif defined(__APPLE__)
@@ -393,6 +396,37 @@ static bool TryEmulateMonitorxMwaitx(ucontext_t* context) {
 	return true;
 }
 
+// INT 0x41 is the PlayStation SDK debug break. On a retail console with no debugger
+// attached the kernel swallows it and the guest resumes at the next instruction, which
+// is why shipped titles keep fatal asserts armed and still run: the trap after the
+// assert report is a no-op. Under a host OS the same instruction raises a general
+// protection fault (delivered as a write access violation at address 0), so it has to
+// be stepped over explicitly or every game assert kills the emulator.
+//
+// Muro 27: Astro Bot's Network/Json.cpp:399 asserts that an OPTIONAL material field is
+// a boolean, reports it, and traps — killing every boot at ~flip 1160.
+static bool TryEmulateDebugBreak(ucontext_t* context) {
+	if (context == nullptr || context->uc_mcontext == nullptr) {
+		return false;
+	}
+
+	auto&       ss  = context->uc_mcontext->__ss;
+	const auto* rip = reinterpret_cast<const uint8_t*>(ss.__rip);
+	if (rip[0] != 0xcd || rip[1] != 0x41) {
+		return false;
+	}
+
+	static std::atomic_uint64_t g_breaks {0};
+	const auto                  count = g_breaks.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count <= 8 || (count & 0x3fu) == 0) {
+		std::fprintf(stderr, "guest debug break ignored: rip=0x%016llx count=%llu\n",
+		             static_cast<unsigned long long>(ss.__rip),
+		             static_cast<unsigned long long>(count));
+	}
+	ss.__rip += 2;
+	return true;
+}
+
 #endif
 
 bool TryEmulate(void* native_context) {
@@ -401,7 +435,8 @@ bool TryEmulate(void* native_context) {
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context);
 #else
 	auto* context = static_cast<ucontext_t*>(native_context);
-	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context);
+	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
+	       TryEmulateDebugBreak(context);
 #endif
 }
 
