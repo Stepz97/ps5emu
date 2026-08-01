@@ -366,6 +366,15 @@ public:
 
 	void SetUsePc(uint32_t use_pc) { m_use_pc = use_pc; }
 
+	// Flat SRT reads on a conditionally-executed path may legitimately chase a pointer that
+	// is null in this dispatch's snapshot; that specific failure is soft and degradable. Every
+	// other failure (an address outside the 48-bit space, a rejected descriptor bounds check,
+	// an unresolved/cyclic scalar, an unavailable SGPR, ...) stays fail-closed. Call this
+	// before each top-level Evaluate() and inspect WasSoftFailure() only after Evaluate()
+	// returns false.
+	void ResetFailureClass() { m_soft_failure = false; }
+	bool WasSoftFailure() const { return m_soft_failure; }
+
 	bool Evaluate(uint32_t id, uint32_t& result, std::string* error) {
 		if (id >= m_program.provenance.values.size()) {
 			return Fail(error, fmt::format("invalid scalar value {}", id));
@@ -513,6 +522,10 @@ private:
 		}
 		if (m_runtime.read_memory != nullptr &&
 		    !m_runtime.read_memory(m_runtime.userdata, address, &result)) {
+			// The address itself is valid (it passed the 48-bit/bounds checks above); the
+			// callback declined to service it, which is exactly the "pointer is null in this
+			// dispatch's snapshot" case flat SRT reads are allowed to degrade on.
+			m_soft_failure = true;
 			return Fail(
 			    error, fmt::format("ReadConst pc=0x{:08x} failed at 0x{:016x}", value.pc, address));
 		}
@@ -527,6 +540,7 @@ private:
 	uint32_t              m_use_pc;
 	std::vector<uint32_t> m_values;
 	std::vector<uint8_t>  m_state;
+	bool                  m_soft_failure = false;
 };
 
 // Best-effort evaluation used to anchor the binding window of dynamic-base address resources.
@@ -735,8 +749,11 @@ static bool EvaluateRuntimeSourcesImpl(const Program&                           
 	if (evaluate_flat) {
 		// A flat slot on a conditionally-executed path can chase a pointer that is null in
 		// this dispatch's snapshot (the shader guards the real load; the eager walk cannot).
-		// Such slots become zero instead of failing the whole walk — descriptor sources
-		// above still fail hard on unreadable memory.
+		// Only that specific case — a structurally valid address that the read callback
+		// declined to service — degrades to zero instead of failing the whole walk. An
+		// address that is invalid on its own terms (outside the 48-bit space, a rejected
+		// descriptor bounds check, a negative immediate, an unresolved/cyclic scalar, ...)
+		// still fails closed here, same as descriptor sources above.
 		uint32_t    failed_slots = 0;
 		std::string first_failure;
 		for (const auto& read: program.srt.reads) {
@@ -747,8 +764,15 @@ static bool EvaluateRuntimeSourcesImpl(const Program&                           
 				}
 				return false;
 			}
+			evaluator.ResetFailureClass();
 			std::string slot_error;
 			if (!evaluator.Evaluate(read.value, flattened[read.flat_offset], &slot_error)) {
+				if (!evaluator.WasSoftFailure()) {
+					if (error != nullptr) {
+						*error = std::move(slot_error);
+					}
+					return false;
+				}
 				flattened[read.flat_offset] = 0;
 				if (failed_slots == 0) {
 					first_failure = std::move(slot_error);
