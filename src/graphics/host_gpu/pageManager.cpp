@@ -381,6 +381,19 @@ uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
 }
 
+bool PageManager::IsWatched(uint64_t vaddr) const noexcept {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	// Lock-free racy read on purpose, mirroring DumpWatchedRanges: callers treat this as
+	// a heuristic (walk bounds, defensive brakes) and may already sit inside a fault
+	// resolution holding the resource mutex — taking the page spinlock here can spin
+	// against a holder that is itself waiting on the GPU thread running this very code.
+	auto& page = m_impl->GetPage(*region, vaddr);
+	return page.write_watchers != 0 || page.access_watchers != 0;
+}
+
 bool PageManager::IsGuarded(uint64_t vaddr) const noexcept {
 	auto* region = m_impl->FindRegion(vaddr);
 	if (region == nullptr) {

@@ -29,6 +29,62 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	bool       handled = false;
 	const auto resolve = [this, access, fault_vaddr, guarded, &handled](CommandProcessor& cp) {
 		cp.BeginReadbackTransaction();
+#if defined(__APPLE__)
+		// Muro 18, second pattern (restored after the guest-memory-rework rebase dropped
+		// it): a sequential unaligned wide-store guest memcpy into a multi-page watched
+		// run. Per-page resolution frees only the faulting page, so the store crossing
+		// into the NEXT still-watched page aborts inside Rosetta with no deliverable
+		// fault (same Apple bug as the range-edge case). Free the whole contiguous
+		// watched run above the faulting page before the copy retries — and free it
+		// TOP-DOWN: releasing bottom-up opens a window where a CONCURRENT copier's store
+		// crosses from an already-freed page into a still-watched one. Descending order
+		// keeps the invariant "no writable page sits below a watched one" at every step,
+		// so a racing thread always faults cleanly at instruction start and waits. The
+		// walk stops at the first unwatched page, so an armed guard above the run is
+		// never chained into.
+		const auto forward_resolve = [this, access, fault_vaddr, guarded]() {
+			if (access != PageFaultAccess::Write) {
+				return;
+			}
+			const auto page_size = m_page_manager.GetPageSize();
+			const auto run_low = (fault_vaddr & ~(page_size - 1)) + page_size * (guarded ? 2 : 1);
+			auto       run_end = run_low;
+			while (m_page_manager.IsWatched(run_end)) {
+				run_end += page_size;
+			}
+			uint64_t resolved = 0;
+			for (auto addr = run_end; addr > run_low;) {
+				addr -= page_size;
+				(void)m_buffer_cache.SynchronizeBacking(addr, 1);
+				ResourceMutex::FaultScope forward_fault(m_resource_mutex);
+				m_buffer_cache.InvalidateMemory(addr, 1);
+				m_texture_cache.InvalidateMemory(addr, 1);
+				if (m_page_manager.IsWatched(addr)) {
+					// A page that stays watched after both invalidations would leave the
+					// pages freed below it sitting writable under a watched one — the
+					// exact geometry this walk exists to prevent. Stop here so the run
+					// keeps its safe floor (mirrors the break-on-failure of the original
+					// per-page resolution).
+					std::fprintf(stderr,
+					             "forward-resolve: page 0x%016llx stayed watched, "
+					             "stopping run walk\n",
+					             static_cast<unsigned long long>(addr));
+					break;
+				}
+				resolved++;
+			}
+			if (resolved >= 16) {
+				std::fprintf(stderr,
+				             "forward-resolve: freed %llu watched pages above 0x%016llx\n",
+				             static_cast<unsigned long long>(resolved),
+				             static_cast<unsigned long long>(fault_vaddr));
+			}
+		};
+		// The run above the faulting page is freed FIRST (top-down): the faulting page
+		// itself stays protected until the main resolution below, so a concurrent copier
+		// can never find a writable page under a watched one while the run unwinds.
+		forward_resolve();
+#endif
 		{
 			ResourceMutex::FaultScope fault(m_resource_mutex);
 			if (guarded) {

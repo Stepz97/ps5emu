@@ -35,6 +35,8 @@ public:
 	KYTY_CLASS_NO_COPY(PageManager);
 
 	[[nodiscard]] uint64_t GetPageSize() const;
+	// True when the page currently has any write or access watcher.
+	[[nodiscard]] bool IsWatched(uint64_t vaddr) const noexcept;
 	// True when the page is (or was recently) a muro-18 guard below a watched range.
 	[[nodiscard]] bool IsGuarded(uint64_t vaddr) const noexcept;
 	// Disarms a muro-18 guard at vaddr if armed, restoring plain read-write access. No-op
