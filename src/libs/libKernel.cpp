@@ -1622,7 +1622,26 @@ static void* KYTY_SYSV_ABI mmap(void* addr, size_t len, int prot, int flags, int
 	     static_cast<uint64_t>(offset));
 
 	constexpr size_t MMAP_PAGE_SIZE = 0x4000; // matches Memory::KernelMapNamedFlexibleMemory's PAGE_SIZE
-	constexpr int    GUEST_MAP_ANON = 0x1000; // matches memory.cpp's GUEST_MAP_ANON
+
+	// POSIX/FreeBSD mmap flag namespace, as the guest passes it. This is NOT the sce
+	// FlexibleMemory flag namespace that KernelMapNamedFlexibleMemory validates (the bits
+	// collide: 0x400 is MAP_STACK here but MAP_DMEM_COMPAT there), so guest flags must be
+	// translated at this boundary, never forwarded raw.
+	constexpr int GUEST_MAP_SHARED       = 0x01;
+	constexpr int GUEST_MAP_PRIVATE      = 0x02;
+	constexpr int GUEST_MAP_FIXED        = 0x10; // same bit and meaning in both namespaces
+	constexpr int GUEST_MAP_NO_OVERWRITE = 0x80; // same bit and meaning in both namespaces
+	constexpr int GUEST_MAP_VOID         = 0x100;
+	constexpr int GUEST_MAP_STACK        = 0x400;
+	constexpr int GUEST_MAP_NO_SYNC      = 0x800;
+	constexpr int GUEST_MAP_ANON         = 0x1000;
+	constexpr int GUEST_MAP_NO_CORE      = 0x20000;
+	// Accepted = the set the pre-rework tree accepted for these anonymous-only mappings.
+	// FIXED and NO_OVERWRITE keep their bit and meaning in the sce namespace and are
+	// forwarded; the rest are implicit for anonymous flexible memory and are dropped.
+	constexpr int POSIX_MAP_ACCEPTED = GUEST_MAP_SHARED | GUEST_MAP_PRIVATE | GUEST_MAP_FIXED |
+	                                   GUEST_MAP_NO_OVERWRITE | GUEST_MAP_VOID | GUEST_MAP_STACK |
+	                                   GUEST_MAP_NO_SYNC | GUEST_MAP_ANON | GUEST_MAP_NO_CORE;
 
 	// Supported bitmask matching DecodeMemoryProtection (memory.cpp): PROT_CPU_READ|WRITE|EXEC and
 	// PROT_GPU_READ|WRITE. Guest input must NEVER be allowed to reach DecodeMemoryProtection's
@@ -1658,8 +1677,15 @@ static void* KYTY_SYSV_ABI mmap(void* addr, size_t len, int prot, int flags, int
 		return reinterpret_cast<void*>(-1);
 	}
 
-	void* addr_out = addr;
-	int   result   = Memory::KernelMapNamedFlexibleMemory(&addr_out, aligned_len, prot, flags, "mmap");
+	if ((flags & ~POSIX_MAP_ACCEPTED) != 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return reinterpret_cast<void*>(-1);
+	}
+
+	void* addr_out  = addr;
+	int   sce_flags = flags & (GUEST_MAP_FIXED | GUEST_MAP_NO_OVERWRITE);
+	int   result =
+	    Memory::KernelMapNamedFlexibleMemory(&addr_out, aligned_len, prot, sce_flags, "mmap");
 	if (result != OK) {
 		*Posix::GetErrorAddr() = KernelToPosix(result);
 		return reinterpret_cast<void*>(-1);
