@@ -1915,6 +1915,7 @@ Instruction FindLsb(uint32_t pc, uint32_t dst, uint32_t src) {
 // failing resource tracking, and its reads must never receive flat SRT slots.
 void TestUnknownScalarBaseDegradesToDynamicBase() {
   Program program;
+  program.stage = ShaderType::Compute;
   program.blocks.resize(1);
   auto &insts = program.blocks[0].instructions;
   insts.push_back(FindLsb(0x00, 20, 24));
@@ -1949,7 +1950,11 @@ void TestUnknownScalarBaseDegradesToDynamicBase() {
             program.info.addresses[1].dynamic_base &&
             program.info.addresses[0].kind == ResourceKind::ScalarBuffer,
         "degraded loads did not become dynamic-base address resources");
-  Check(AllocateBindings(program, {}, &error), error.c_str());
+  ShaderComputeInputInfo compute;
+  compute.thread_ids_num = 1;
+  Check(CollectShaderInfo(program, {.compute = &compute}, &error) &&
+            AllocateBindings(program, {}, &error),
+        error.c_str());
 }
 
 // The dynamic-base window anchor comes from best-effort evaluation: Unknown leaves count
