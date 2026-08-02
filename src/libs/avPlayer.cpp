@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -32,6 +33,39 @@ extern "C" {
 }
 
 namespace Libs::Audio::AvPlayer {
+
+// m43g-intro probe (TEMPORARY, remove before commit): host-side RGBA mirror of the last
+// decoded video frame, for direct presentation when the guest drops its own video draws.
+struct HostMovieMirror {
+	std::mutex           mutex;
+	std::vector<uint8_t> rgba;
+	uint32_t             width  = 0;
+	uint32_t             height = 0;
+	uint64_t             seq    = 0;
+	std::atomic<bool>    active {false};
+};
+static HostMovieMirror g_host_movie;
+
+bool HostMovieActive() {
+	return g_host_movie.active.load(std::memory_order_relaxed);
+}
+
+bool HostMovieAcquire(std::vector<uint8_t>& out, uint32_t& width, uint32_t& height,
+                      uint64_t& last_seq) {
+	if (!g_host_movie.active.load(std::memory_order_relaxed)) {
+		return false;
+	}
+	std::lock_guard lock(g_host_movie.mutex);
+	if (g_host_movie.seq == last_seq || g_host_movie.rgba.empty()) {
+		return false;
+	}
+	out      = g_host_movie.rgba;
+	width    = g_host_movie.width;
+	height   = g_host_movie.height;
+	last_seq = g_host_movie.seq;
+	return true;
+}
+
 
 LIB_NAME("AvPlayer", "AvPlayer");
 
@@ -646,6 +680,7 @@ public:
 		StopNoLock(true);
 		if (was_playing_video) {
 			::printf("AvPlayer video stopped\n");
+		g_host_movie.active.store(false, std::memory_order_relaxed); // m43g (TEMPORARY)
 		}
 		return 0;
 	}
@@ -664,7 +699,19 @@ public:
 	void     SetSync(uint32_t v) { sync_mode = v; }
 	void     SetTrick(int32_t v) { trick_speed = v; }
 	bool     Active() const { return !stopped && !eof; }
+	uint64_t last_video_pts = 0; // m43e-intro probe (TEMPORARY)
 	uint64_t CurrentTime() const {
+		if (stopped) {
+			return 0;
+		}
+		// m43e-intro probe (TEMPORARY, remove before commit): media-driven player clock.
+		static const bool media_clock = std::getenv("KYTY_M43_MEDIA_CLOCK") != nullptr;
+		if (media_clock && last_video_pts != 0) {
+			return last_video_pts;
+		}
+		return WallTime();
+	}
+	uint64_t WallTime() const {
 		if (stopped) {
 			return 0;
 		}
@@ -728,6 +775,13 @@ public:
 			return false;
 		}
 		*out = current_video_info;
+		last_video_pts = current_video_info.time_stamp; // m43e-intro probe (TEMPORARY)
+		// m43f-intro probe (TEMPORARY): stamp each delivered frame with "now" so the guest's
+		// own A/V clock can never classify it as late (KYTY_M43_PTS_LIE=1).
+		static const bool pts_lie = std::getenv("KYTY_M43_PTS_LIE") != nullptr;
+		if (pts_lie) {
+			out->time_stamp = WallTime();
+		}
 		if (deliver_seek_frame) {
 			seek_video_frame_pending = false;
 		}
@@ -1097,10 +1151,38 @@ private:
 		current_video_info.details.video.crop_bottom_offset =
 		    static_cast<uint32_t>(src->crop_bottom + (h - src->height));
 		current_video_info.details.video.pitch = pitch;
+		// m43g-intro probe (TEMPORARY): mirror this frame as host RGBA for direct present.
+		static const bool host_movie = std::getenv("KYTY_M43_HOST_MOVIE") != nullptr;
+		if (host_movie) {
+			if (rgb_sws == nullptr || rgb_w != src->width || rgb_h != src->height) {
+				if (rgb_sws != nullptr) {
+					sws_freeContext(rgb_sws);
+				}
+				rgb_sws = sws_getContext(src->width, src->height, AV_PIX_FMT_NV12, src->width,
+				                         src->height, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr,
+				                         nullptr, nullptr);
+				rgb_w   = src->width;
+				rgb_h   = src->height;
+			}
+			if (rgb_sws != nullptr) {
+				std::lock_guard mlock(g_host_movie.mutex);
+				g_host_movie.rgba.resize(static_cast<size_t>(src->width) * src->height * 4);
+				uint8_t* planes[1]  = {g_host_movie.rgba.data()};
+				int      strides[1] = {src->width * 4};
+				sws_scale(rgb_sws, nv12->data, nv12->linesize, 0, src->height, planes, strides);
+				g_host_movie.width  = static_cast<uint32_t>(src->width);
+				g_host_movie.height = static_cast<uint32_t>(src->height);
+				g_host_movie.seq++;
+				g_host_movie.active.store(true, std::memory_order_relaxed);
+			}
+		}
 		if (tmp) {
 			av_frame_free(&tmp);
 		}
 	}
+	SwsContext* rgb_sws = nullptr; // m43g-intro probe (TEMPORARY)
+	int         rgb_w   = 0;
+	int         rgb_h   = 0;
 	GuestBuffer* AllocateVideoBuffer() {
 		if (video_buffers.empty()) {
 			return nullptr;
@@ -1515,16 +1597,30 @@ int KYTY_SYSV_ABI AvPlayerSetAvailableBandwidth(AvPlayerInternal* h, uint32_t st
 	h->maximum_bandwidth = maximum_bandwidth;
 	return h->source == nullptr ? 0 : AVPLAYER_ERROR_OPERATION_FAILED;
 }
+// m43c-intro probe (TEMPORARY, remove before commit): does the guest ever PULL video
+// frames, or only audio? Counts calls and outcomes for the three data getters.
+static void M43cCount(const char* which, int outcome) {
+	static std::atomic<uint32_t> counts[6] {};
+	const int  base = (which[0] == 'v') ? 0 : (which[0] == 'x') ? 2 : 4;
+	const auto n    = counts[base + (outcome != 0 ? 0 : 1)].fetch_add(1) + 1;
+	if (n <= 8 || (n & 0x1ffu) == 0) {
+		std::fprintf(stderr, "m43c-avpull: %s outcome=%d count=%u\n", which, outcome, n);
+	}
+}
+
 Bool KYTY_SYSV_ABI AvPlayerGetVideoData(AvPlayerInternal* h, AvPlayerFrameInfo* video_info) {
 	PRINT_NAME();
 	if (h == nullptr || h->source == nullptr || video_info == nullptr) {
+		M43cCount("video", -1);
 		return 0;
 	}
 	AvPlayerFrameInfoEx ex {};
 	if (!h->source->Video(&ex)) {
 		pump_warnings(h);
+		M43cCount("video", 0);
 		return 0;
 	}
+	M43cCount("video", 1);
 	std::memset(video_info, 0, sizeof(*video_info));
 	video_info->data                       = ex.data;
 	video_info->time_stamp                 = ex.time_stamp;
@@ -1541,10 +1637,34 @@ Bool KYTY_SYSV_ABI AvPlayerGetVideoDataEx(AvPlayerInternal* h, AvPlayerFrameInfo
 	}
 	auto ok = h->source->Video(video_info) ? 1 : 0;
 	pump_warnings(h);
+	M43cCount("xvideoEx", ok);
+	// m43d-intro probe (TEMPORARY): where does each delivered frame live, and is it black?
+	if (ok != 0) {
+		static std::atomic<uint32_t> frame_log {0};
+		const auto fn = frame_log.fetch_add(1) + 1;
+		if (fn <= 12 || (fn & 0x1fu) == 0) {
+			uint64_t luma_sum = 0;
+			const auto* base = static_cast<const uint8_t*>(video_info->data);
+			const auto  w    = video_info->details.video.width;
+			const auto  h2   = video_info->details.video.height;
+			if (base != nullptr && w > 0 && h2 > 0) {
+				const uint64_t plane = static_cast<uint64_t>(w) * h2;
+				for (uint64_t off = plane / 3; off < plane / 3 + 4096 && off < plane; off++) {
+					luma_sum += base[off];
+				}
+			}
+			std::fprintf(stderr,
+			             "m43d-frame: n=%u data=%p %ux%u ts=%llu luma4k=%llu\n", fn,
+			             static_cast<const void*>(base), w, h2,
+			             static_cast<unsigned long long>(video_info->time_stamp),
+			             static_cast<unsigned long long>(luma_sum));
+		}
+	}
 	return ok;
 }
 Bool KYTY_SYSV_ABI AvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* audio_info) {
 	PRINT_NAME();
+	M43cCount("audio", 1);
 	if (h == nullptr || h->source == nullptr || audio_info == nullptr) {
 		return 0;
 	}

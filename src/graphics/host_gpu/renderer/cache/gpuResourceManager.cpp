@@ -179,6 +179,53 @@ bool GpuResourceManager::SynchronizeImageToMemory(uint64_t vaddr, uint64_t size)
 	return synchronized;
 }
 
+bool GpuResourceManager::SynchronizeBufferToMemory(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size) || CommandScheduler::InDeferredOperation()) {
+		return false;
+	}
+	// Widen the pull to whole tracker pages so a single download (one GPU drain) settles
+	// every later read of the same table instead of paying one drain per dword.
+	auto page_begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	auto page_end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	if (!IsMapped(page_begin, page_end - page_begin)) {
+		// The widened window can cross out of the mapped range at an allocation edge;
+		// fall back to the exact range instead of assuming the guest's allocation
+		// granularity keeps whole tracker pages mapped around every readable address.
+		page_begin = vaddr;
+		page_end   = vaddr + size;
+	}
+	if (!m_buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+		return false;
+	}
+	bool       synchronized = false;
+	const auto resolve      = [this, page_begin, page_end, &synchronized](CommandProcessor& cp) {
+        cp.BeginReadbackTransaction();
+        {
+            ResourceMutex::FaultScope fault(m_resource_mutex);
+            m_buffer_cache.ReadMemory(page_begin, page_end - page_begin);
+            synchronized = true;
+        }
+        cp.EndReadbackTransaction();
+	};
+	if (auto* cp = Gpu::CurrentCommandProcessor(); cp != nullptr) {
+		resolve(*cp);
+		return synchronized;
+	}
+	if (m_resource_mutex.IsOwnedByCurrentThread() || m_gpu == nullptr) {
+		return false;
+	}
+	m_gpu->SendCommandSyncWithProcessor(resolve);
+	return synchronized;
+}
+
+bool GpuResourceManager::IsBufferRegionGpuModified(uint64_t vaddr, uint64_t size) {
+	return IsMapped(vaddr, size) && m_buffer_cache.IsRegionGpuModified(vaddr, size);
+}
+
+bool GpuResourceManager::IsBufferRegionCpuModified(uint64_t vaddr, uint64_t size) {
+	return IsMapped(vaddr, size) && m_buffer_cache.IsRegionCpuModified(vaddr, size);
+}
+
 bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {

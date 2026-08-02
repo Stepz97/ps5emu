@@ -20,11 +20,13 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <set>
 #include <tuple>
+#include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -32,6 +34,50 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// m42-dual (TEMPORARY, remove before commit): guest bases watched by the wall-42
+// dual-identity discriminator, KYTY_M42_DUAL=<hex,hex,...>. Shared gate with the
+// renderDraw.cpp probe; here it logs every identity event (birth, death, overlap
+// decision) the cache takes on a watched base.
+const std::vector<uint64_t>& M42DualBases() {
+	static const std::vector<uint64_t> bases = []() {
+		std::vector<uint64_t> parsed;
+		if (const char* v = std::getenv("KYTY_M42_DUAL"); v != nullptr) {
+			const char* p = v;
+			while (*p != '\0') {
+				char*      end  = nullptr;
+				const auto base = std::strtoull(p, &end, 16);
+				if (end == p) {
+					break;
+				}
+				if (base != 0) {
+					parsed.push_back(base);
+				}
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return parsed;
+	}();
+	return bases;
+}
+
+bool M42DualWatched(uint64_t addr) {
+	const auto& bases = M42DualBases();
+	return !bases.empty() && std::find(bases.begin(), bases.end(), addr) != bases.end();
+}
+
+// m42-dual (TEMPORARY, remove before commit): call-site attribution for DeleteImage.
+// Each deleting path opens a scope naming itself; the delete log prints the innermost
+// active tag, so watched deletes can be traced to their driver in a single grep.
+thread_local const char* g_m42_delete_site = nullptr;
+
+struct M42DeleteSiteScope {
+	const char* saved;
+	explicit M42DeleteSiteScope(const char* site): saved(g_m42_delete_site) {
+		g_m42_delete_site = site;
+	}
+	~M42DeleteSiteScope() { g_m42_delete_site = saved; }
+};
 
 thread_local const TextureCache* g_locked_cache = nullptr;
 
@@ -228,6 +274,15 @@ void TextureCache::DeleteImage(ImageId id) {
 	auto owner = ResolveOwner(id);
 	if (owner == nullptr || !owner->registered) {
 		return;
+	}
+	// m42-dual (TEMPORARY, remove before commit): every death of a watched image, any cause.
+	if (M42DualWatched(owner->info.data.address)) {
+		LOGF("m42-dual-cache: delete addr=0x%010" PRIx64 " image=%u.%u extent=%ux%u"
+		     " gpu_modified=%d tick=%" PRIu64 " last=%" PRIu64 " site=%s\n",
+		     owner->info.data.address, id.index, id.generation, owner->info.extent.width,
+		     owner->info.extent.height, owner->IsGpuModified() ? 1 : 0,
+		     m_scheduler.CurrentTick(), owner->tick_accessed_last,
+		     g_m42_delete_site != nullptr ? g_m42_delete_site : "untagged");
 	}
 	if (!owner->depth_id) {
 		std::vector<ImageId> associations;
@@ -650,6 +705,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
+	const M42DeleteSiteScope m42_site("depth-overlap"); // m42-dual (TEMPORARY)
 	auto& cached = ResolveImage(cached_id);
 	if (!cached.info.IsDepth() && !requested.IsDepth()) {
 		return {};
@@ -724,6 +780,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
+	const M42DeleteSiteScope m42_site("overlap"); // m42-dual (TEMPORARY)
 	auto owner = ResolveOwner(cached_id);
 	if (owner == nullptr) {
 		return {merged_id};
@@ -733,11 +790,36 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
 
+	// m42-dual (TEMPORARY, remove before commit): identity of WHO walks over a watched
+	// image — requester address/size/extent/format/binding vs the cached victim. The
+	// adjacent delete log (site=overlap) correlates by log order.
+	if (M42DualWatched(cached.info.data.address) || M42DualWatched(requested.data.address)) {
+		LOGF("m42-dual-cache: overlap-enter req_addr=0x%010" PRIx64 " req_size=0x%" PRIx64
+		     " req_extent=%ux%u req_fmt=%u binding=%u cached_addr=0x%010" PRIx64
+		     " cached=%u.%u cached_extent=%ux%u safe_to_delete=%d tick=%" PRIu64 "\n",
+		     requested.data.address, requested.data.size, requested.extent.width,
+		     requested.extent.height, static_cast<uint32_t>(requested.pixel_format),
+		     static_cast<uint32_t>(binding), cached.info.data.address, cached_id.index,
+		     cached_id.generation, cached.info.extent.width, cached.info.extent.height,
+		     safe_to_delete ? 1 : 0, current_tick);
+	}
+
 	if (requested.data.address == cached.info.data.address) {
 		const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 		const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 		if (requested.BlockExtent() != cached.info.BlockExtent() ||
 		    requested_block != cached_block) {
+			// m42-dual (TEMPORARY, remove before commit): the exact bifurcation that can
+			// birth a second identity at the same base — equal address, extent mismatch.
+			if (M42DualWatched(requested.data.address)) {
+				LOGF("m42-dual-cache: overlap addr=0x%010" PRIx64 " requested=%ux%u binding=%u"
+				     " cached=%ux%u image=%u.%u safe_to_delete=%d tick=%" PRIu64
+				     " last=%" PRIu64 "\n",
+				     requested.data.address, requested.extent.width, requested.extent.height,
+				     static_cast<uint32_t>(binding), cached.info.extent.width,
+				     cached.info.extent.height, cached_id.index, cached_id.generation,
+				     safe_to_delete ? 1 : 0, current_tick, cached.tick_accessed_last);
+			}
 			if (safe_to_delete) {
 				DeleteImages(std::array {cached_id}, cached_id);
 			}
@@ -819,6 +901,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	const M42DeleteSiteScope m42_site("expand"); // m42-dual (TEMPORARY)
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      expanded    = ResolveImage(expanded_id);
@@ -1065,6 +1148,27 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 	TrackImage(id);
 	auto& image = ResolveImage(id);
+	// m43b-intro probe (TEMPORARY, remove before commit): trace the exact refresh decision
+	// for every scan-out surface, plus a cheap guest-content probe, to pin down which branch
+	// starves the CPU-composed video frames.
+	if (desc.type == BindingType::VideoOut) {
+		static std::atomic<uint32_t> probe_count {0};
+		const auto n = probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 24 || (n & 0x3fu) == 0) {
+			// guest_sample raw reads REMOVED: they faulted watched pages on every present,
+			// dragging partial readbacks that stole the present's GPU-owned source (the
+			// probe was blacking out the very dither it measured - Aug 2 blackout bisect).
+			const uint64_t guest_sample = 0;
+			std::fprintf(stderr,
+			             "m43b-refresh: addr=0x%011llx maybe=%d needs_hash=%d definitely=%d "
+			             "buffer_mod=%d gpu_mod=%d rt=%d guest_mid_sum=%llu (n=%u)\n",
+			             static_cast<unsigned long long>(image.info.data.address),
+			             image.IsMaybeCpuDirty() ? 1 : 0, image.NeedsMaybeCpuHash() ? 1 : 0,
+			             image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+			             image.IsGpuModified() ? 1 : 0, image.usage.render_target ? 1 : 0,
+			             static_cast<unsigned long long>(guest_sample), n);
+		}
+	}
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
@@ -1181,7 +1285,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					EXIT("TextureCache: cannot preserve an unsupported replacement image\n");
 				}
 				replacement_buffer = resolved.IsBufferModified();
-				DeleteImage(result);
+				{
+					const M42DeleteSiteScope m42_site("shrink-replace"); // m42-dual (TEMPORARY)
+					DeleteImage(result);
+				}
 				result = {};
 			}
 		}
@@ -1195,6 +1302,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (inserted_new) {
+			// m42-dual (TEMPORARY, remove before commit): every birth on a watched base.
+			if (M42DualWatched(desc.info.data.address)) {
+				LOGF("m42-dual-cache: insert addr=0x%010" PRIx64 " image=%u.%u extent=%ux%u"
+				     " binding=%u buffer_modified=%d tick=%" PRIu64 "\n",
+				     desc.info.data.address, result.index, result.generation,
+				     desc.info.extent.width, desc.info.extent.height,
+				     static_cast<uint32_t>(desc.type),
+				     ResolveImage(result).IsBufferModified() ? 1 : 0, m_scheduler.CurrentTick());
+			}
 			InitializeImage(result, desc);
 		} else {
 			RefreshImage(result, desc);
@@ -1830,6 +1946,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
+	const M42DeleteSiteScope m42_site("unmap"); // m42-dual (TEMPORARY)
 	std::lock_guard transaction(m_resource_mutex);
 	CacheLock       lock(*this, m_lock);
 	auto            images = FindImagesInRegion(address, size, false);
@@ -1893,6 +2010,15 @@ void TextureCache::RunGarbageCollector() {
 				}
 				ClearGpuModified(id);
 			}
+			// m42-dual (TEMPORARY, remove before commit): why the GC chose a watched image.
+			if (M42DualWatched(owner->info.data.address)) {
+				LOGF("m42-dual-cache: gc-detail image=%u.%u pressured=%d aggressive=%d"
+				     " age=%" PRIu64 " gc_tick=%" PRIu64 " used=%" PRIu64 " trigger=%" PRIu64
+				     " pressure=%" PRIu64 "\n",
+				     id.index, id.generation, pressured ? 1 : 0, aggressive ? 1 : 0, age, tick,
+				     m_total_used_memory, m_trigger_gc_memory, m_pressure_gc_memory);
+			}
+			const M42DeleteSiteScope m42_site("gc"); // m42-dual (TEMPORARY)
 			DeleteImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;

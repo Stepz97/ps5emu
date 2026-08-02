@@ -101,6 +101,7 @@ enum class Opcode {
 	BitFieldMaskU32,
 	BitFieldMaskU64,
 	BitFieldExtractU32,
+	BitFieldExtractI32,
 	BitFieldExtractU64,
 	BitFieldExtract3U32,
 	BitFieldExtract3I32,
@@ -752,9 +753,12 @@ struct BindingLayout {
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 32;
 	static constexpr uint32_t MaxAddresses    = 32;
-	static constexpr uint32_t MaxImages       = 32;
-	static constexpr uint32_t MaxSamplers     = 32;
-	static constexpr uint32_t MaxSampledPairs = 64;
+	// Astro Bot's post-menu gallery PS binds more than 32 sampled images (muro 43, validated
+	// live: with 64 the game accepts menu input and enters gameplay; with 32 the recompiler
+	// exits). Apple Silicon descriptor limits comfortably cover 64 per stage under MoltenVK.
+	static constexpr uint32_t MaxImages       = 64;
+	static constexpr uint32_t MaxSamplers     = 64;
+	static constexpr uint32_t MaxSampledPairs = 128;
 
 	std::vector<BufferResource>      buffers;
 	std::vector<AddressResource>     addresses;

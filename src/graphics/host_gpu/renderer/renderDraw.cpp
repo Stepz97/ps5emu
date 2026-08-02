@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
@@ -36,6 +37,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -221,6 +223,163 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    sc.bottom);
 
 	LogMrtState(draw_name, buffer, ps_input_info);
+}
+
+// m42-ps-trace probe (TEMPORARY, remove before commit): when a draw writes into one of the
+// KYTY_M42_TRACE_PS render targets (the 4K flip buffers), log every texture and buffer its
+// pixel shader reads — the compose/tonemap pass is a draw, invisible to the compute-side
+// probes, and its inputs are the last unknown of the black-menu chain. Linear sampled
+// textures also get a content pull (safe: the detile EXIT only bites tiled formats).
+static void M42TracePsDraw(const RenderCommandBuffer& buffer, const RenderColorInfo* color_info,
+                           uint32_t color_count, const ShaderPixelInputInfo& ps_input_info) {
+	static const std::vector<uint64_t> trace_rts = []() {
+		std::vector<uint64_t> bases;
+		if (const char* v = std::getenv("KYTY_M42_TRACE_PS"); v != nullptr) {
+			const char* p = v;
+			while (*p != '\0') {
+				char*      end  = nullptr;
+				const auto base = std::strtoull(p, &end, 16);
+				if (end == p) {
+					break;
+				}
+				if (base != 0) {
+					bases.push_back(base);
+				}
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return bases;
+	}();
+	if (trace_rts.empty() || !ps_input_info.stage) {
+		return;
+	}
+	uint64_t hit_rt = 0;
+	for (uint32_t i = 0; i < color_count && hit_rt == 0; i++) {
+		if (std::find(trace_rts.begin(), trace_rts.end(), color_info[i].base_addr) !=
+		    trace_rts.end()) {
+			hit_rt = color_info[i].base_addr;
+		}
+	}
+	if (hit_rt == 0) {
+		return;
+	}
+	const auto& program   = *ps_input_info.stage.program;
+	const auto& resources = *ps_input_info.stage.resources;
+	if (resources.images.size() != program.info.images.size() ||
+	    resources.buffers.size() != program.info.buffers.size()) {
+		return;
+	}
+	// m42-fade-defeat (TEMPORARY, remove before commit): the guest parks the compose color
+	// multiplier at [0,0,0,1|0,0,0,1] (fade-to-black of the load->menu transition) and the
+	// fade-in never starts under the emulator. When enabled, rewrite that exact signature
+	// to [1,1,1,0|1,1,1,0] in the guest backing BEFORE the bindings upload it, every draw
+	// (the guest re-writes the ring param each frame, so this must too). Diagnosis hack,
+	// not the root fix: the real hunt is the condition gating the guest's fade-in.
+	static const bool m42_force_fade = []() {
+		const char* v = std::getenv("KYTY_M42_FORCE_FADE");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (m42_force_fade) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			if (program.info.buffers[i].written) {
+				continue;
+			}
+			const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			const uint64_t bufsize = static_cast<uint64_t>(r.Stride()) * r.NumRecords();
+			if (r.Base48() == 0 || bufsize < 32 || bufsize > 256) {
+				continue;
+			}
+			float f[8] = {};
+			if (!LibKernel::Memory::TryReadBacking(r.Base48(), f, sizeof(f))) {
+				continue;
+			}
+			const bool black_fade = f[0] == 0.0f && f[1] == 0.0f && f[2] == 0.0f &&
+			                        f[3] == 1.0f && f[4] == 0.0f && f[5] == 0.0f &&
+			                        f[6] == 0.0f && f[7] == 1.0f;
+			if (black_fade) {
+				const float white[8] = {1.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f};
+				if (LibKernel::Memory::TryWriteBacking(r.Base48(), white, sizeof(white))) {
+					static std::atomic<uint32_t> fade_count {0};
+					const auto n = fade_count.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (n <= 8 || (n & 0xffu) == 0) {
+						LOGF("m42-fade-defeat: forced compose params to white at 0x%012" PRIx64
+						     " (n=%u)\n",
+						     r.Base48(), n);
+					}
+				}
+			}
+		}
+	}
+	const uint32_t frame = static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum());
+	static Common::Mutex                          ps_trace_mutex;
+	static std::unordered_map<uint64_t, uint32_t> ps_trace_last;
+	{
+		Common::LockGuard ps_lock(ps_trace_mutex);
+		auto& last = ps_trace_last[reinterpret_cast<uint64_t>(ps_input_info.stage.program.get())];
+		if (last != 0 && frame < last + 128u) {
+			return;
+		}
+		last = std::max(frame, 1u);
+	}
+	LOGF("m42-ps: frame=%u draw->0x%010" PRIx64 " textures=%zu buffers=%zu\n", frame, hit_rt,
+	     program.info.images.size(), program.info.buffers.size());
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		LOGF("m42-ps:   buf[%u] usage=%s addr=0x%012" PRIx64 " stride=%u records=%u\n", i,
+		     program.info.buffers[i].written ? "read-write" : "read-only", r.Base48(), r.Stride(),
+		     r.NumRecords());
+		const uint64_t bufsize =
+		    static_cast<uint64_t>(r.Stride()) * r.NumRecords();
+		if (r.Base48() != 0 && bufsize > 0 && bufsize <= 256) {
+			std::array<uint8_t, 256> raw {};
+			if (LibKernel::Memory::TryReadBacking(r.Base48(), raw.data(), bufsize)) {
+				char hex[3 * 32 + 1] = {};
+				const auto n = std::min<uint64_t>(bufsize, 32);
+				for (uint64_t b = 0; b < n; b++) {
+					std::snprintf(hex + b * 3, 4, "%02x ", raw[b]);
+				}
+				float f[8] = {};
+				std::memcpy(f, raw.data(), std::min<uint64_t>(bufsize, sizeof(f)));
+				LOGF("m42-ps:     content hex=[%s] f32=[%g %g %g %g %g %g %g %g]\n",
+				     hex, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+			}
+		}
+	}
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto     r    = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+		const uint64_t base = r.Base40();
+		const uint32_t width  = static_cast<uint32_t>(r.Width5()) + 1u;
+		const uint32_t height = static_cast<uint32_t>(r.Height5()) + 1u;
+		const uint32_t depth  = static_cast<uint32_t>(r.Depth()) + 1u;
+		uint32_t max_byte = 0;
+		uint64_t nonzero  = 0;
+		uint64_t total    = 0;
+		if (base != 0 && r.TileMode() == 0) {
+			const uint64_t est = std::clamp<uint64_t>(
+			    static_cast<uint64_t>(width) * height * std::max(depth, 1u) * 4u, 0x1000u,
+			    32u << 20u);
+			(void)LibKernel::Memory::SynchronizeGpuImageToMemory(base, est);
+			std::array<uint8_t, 4096> chunk {};
+			for (uint32_t c = 0; c < 16; c++) {
+				const uint64_t offset = ((est * c) / 16u) & ~0xfffull;
+				if (!LibKernel::Memory::TryReadBacking(base + offset, chunk.data(),
+				                                       chunk.size())) {
+					continue;
+				}
+				for (const auto b: chunk) {
+					max_byte = std::max<uint32_t>(max_byte, b);
+					nonzero += (b != 0 ? 1u : 0u);
+				}
+				total += chunk.size();
+			}
+		}
+		LOGF("m42-ps:   img[%u] usage=%s base=0x%010" PRIx64 " fmt=%u %ux%ux%u tile=%u max=%u "
+		     "nonzero=%.1f%% bytes=%" PRIu64 "\n",
+		     i, program.info.images[i].written ? "read-write" : "read-only", base, r.Format(),
+		     width, height, depth, r.TileMode(), max_byte,
+		     total != 0 ? 100.0 * static_cast<double>(nonzero) / static_cast<double>(total) : 0.0,
+		     total);
+	}
 }
 
 static void LogDrawInputState(const RenderCommandBuffer& buffer, const RenderColorInfo& color,
@@ -838,6 +997,84 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	}
 	ResolveRenderDepthTarget(submit_id, buffer, state.depth_info);
 
+	// m42-rt census (TEMPORARY, remove before commit): first sighting of every color/depth
+	// render-target base a draw writes, to join offline against the m42-gbuf probe and
+	// answer "does anything ever render into the G-buffer textures the lighting CS
+	// samples?". Gated by KYTY_M42_GBUF_PROBE=1 (same experiment).
+	static const bool m42_rt_census = []() {
+		const char* v = std::getenv("KYTY_M42_GBUF_PROBE");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (m42_rt_census) {
+		static Common::Mutex                rt_mutex;
+		static std::unordered_set<uint64_t> rt_seen;
+		const auto rt_first_sight = [](uint64_t addr) {
+			Common::LockGuard rt_lock(rt_mutex);
+			return rt_seen.insert(addr).second;
+		};
+		const uint32_t rt_frame = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+		// Draw/index volume per target: first sight says "somebody binds it"; these
+		// counters say whether real geometry flows into it (an empty-geometry pass and a
+		// full one are indistinguishable by first sight alone).
+		static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> rt_volume;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& info = state.color_info[i];
+			if (info.base_addr != 0 && rt_first_sight(info.base_addr)) {
+				LOGF("m42-rt: frame=%u color base=0x%010" PRIx64 " slot=%u extent=%ux%u\n",
+				     rt_frame, info.base_addr, info.target_slot, info.extent.width,
+				     info.extent.height);
+			}
+			if (info.base_addr != 0) {
+				Common::LockGuard rt_lock(rt_mutex);
+				auto& [draws, indices] = rt_volume[info.base_addr];
+				draws++;
+				indices += draw.index_count;
+				if ((draws & 0xffu) == 1u && draws > 1u) {
+					LOGF("m42-rt-count: frame=%u base=0x%010" PRIx64 " draws=%" PRIu64
+					     " indices=%" PRIu64 "\n",
+					     rt_frame, info.base_addr, draws, indices);
+				}
+			}
+		}
+		if (state.depth_info.depth_buffer_vaddr != 0 &&
+		    rt_first_sight(state.depth_info.depth_buffer_vaddr)) {
+			LOGF("m42-rt: frame=%u depth base=0x%010" PRIx64 " extent=%ux%u\n", rt_frame,
+			     state.depth_info.depth_buffer_vaddr, state.depth_info.width,
+			     state.depth_info.height);
+		}
+	}
+
+	// m42-rt-layout (TEMPORARY, remove before commit): raw register base vs resolved base
+	// vs cache image identity per color target. An aliasing collapse (two guest targets
+	// resolving to one base/image) would explain the AA edge pass trampling the color in
+	// the shared work buffer. Gated by KYTY_M42_RT_LAYOUT=1, first sight per tuple.
+	static const bool m42_rt_layout = []() {
+		const char* v = std::getenv("KYTY_M42_RT_LAYOUT");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (m42_rt_layout) {
+		static Common::Mutex                layout_mutex;
+		static std::unordered_set<uint64_t> layout_seen;
+		const uint32_t layout_frame = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto&    info = state.color_info[i];
+			const uint64_t raw  = static_cast<uint64_t>(ctx.GetRenderTarget(info.target_slot).base.addr);
+			const uint64_t key =
+			    raw ^ (info.base_addr << 1) ^ (static_cast<uint64_t>(info.image_id.index) << 40);
+			bool fresh = false;
+			{
+				Common::LockGuard layout_lock(layout_mutex);
+				fresh = layout_seen.insert(key).second;
+			}
+			if (fresh) {
+				LOGF("m42-rt-layout: frame=%u slot=%u raw=0x%010" PRIx64 " resolved=0x%010" PRIx64
+				     " image=%u.%u extent=%ux%u\n",
+				     layout_frame, info.target_slot, raw, info.base_addr, info.image_id.index,
+				     info.image_id.generation, info.extent.width, info.extent.height);
+			}
+		}
+	}
+
 	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
 	                         static_cast<bool>(state.depth_info.image_id));
 	if (state.color_count == 0 && !with_depth) {
@@ -1080,6 +1317,79 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
 
+	// m42-dual (TEMPORARY, remove before commit): wall-42 dual-identity discriminator. For
+	// each watched guest base (KYTY_M42_DUAL=<hex,hex,...>) log which cache image the pixel
+	// shader SAMPLES vs which image a draw WRITES as color target at that base. If the two
+	// roles resolve to different ImageIds in the menu phase, the compose is reading an
+	// orphaned texture while the live color lands in the RT image. Change-triggered per
+	// (role, base) with a 120-frame heartbeat so stable epochs stay visible.
+	static const std::vector<uint64_t> m42_dual_bases = []() {
+		std::vector<uint64_t> bases;
+		if (const char* v = std::getenv("KYTY_M42_DUAL"); v != nullptr) {
+			const char* p = v;
+			while (*p != '\0') {
+				char*      end  = nullptr;
+				const auto base = std::strtoull(p, &end, 16);
+				if (end == p) {
+					break;
+				}
+				if (base != 0) {
+					bases.push_back(base);
+				}
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return bases;
+	}();
+	if (!m42_dual_bases.empty()) {
+		struct M42DualSeen {
+			uint32_t index      = 0;
+			uint32_t generation = 0;
+			uint32_t width      = 0;
+			uint32_t height     = 0;
+			uint32_t frame      = 0;
+		};
+		static Common::Mutex                            dual_mutex;
+		static std::unordered_map<uint64_t, M42DualSeen> dual_seen;
+		const auto dual_frame = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+		auto       dual_log = [&dual_frame](const char* role, uint64_t role_bit, uint64_t addr,
+		                                    ImageId id, uint32_t width, uint32_t height) {
+			bool report = false;
+			{
+				Common::LockGuard dual_lock(dual_mutex);
+				auto& seen = dual_seen[addr ^ role_bit];
+				report     = seen.index != id.index || seen.generation != id.generation ||
+			             seen.width != width || seen.height != height ||
+			             dual_frame - seen.frame >= 120u;
+				if (report) {
+					seen = {id.index, id.generation, width, height, dual_frame};
+				}
+			}
+			if (report) {
+				LOGF("m42-dual: frame=%u %s base=0x%010" PRIx64 " image=%u.%u extent=%ux%u\n",
+				     dual_frame, role, addr, id.index, id.generation, width, height);
+			}
+		};
+		if (bindings.pixel.has_value()) {
+			for (const auto& tb: bindings.pixel->resources.images) {
+				const uint64_t sampled_addr = tb.desc.info.data.address;
+				if (std::find(m42_dual_bases.begin(), m42_dual_bases.end(), sampled_addr) !=
+				    m42_dual_bases.end()) {
+					dual_log("sampled", 0x8000000000000000ull, sampled_addr, tb.image_id,
+					         tb.desc.info.extent.width, tb.desc.info.extent.height);
+				}
+			}
+		}
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& dual_info = state.color_info[i];
+			if (std::find(m42_dual_bases.begin(), m42_dual_bases.end(), dual_info.base_addr) !=
+			    m42_dual_bases.end()) {
+				dual_log("rt", 0, dual_info.base_addr, dual_info.image_id,
+				         dual_info.extent.width, dual_info.extent.height);
+			}
+		}
+	}
+
 	// scanout-probe: log the FIRST sighting of every color-target base address, to attribute
 	// which pass (if any) renders into the buffer the scan-out presents. Deduped so the hot
 	// path stays one set lookup; only active alongside --dump-scanout.
@@ -1295,6 +1605,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 	}
 
 	RefreshShaders(buffer, draw, true, state);
+	M42TracePsDraw(buffer, state.color_info, state.color_count, state.ps_input_info);
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, index_type_and_size, index_addr);
 
@@ -1390,6 +1701,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	     ucfg.GetPrimType() == Prospero::GpuEnumValue(Prospero::PrimitiveType::kRectList));
 
 	RefreshShaders(buffer, draw, false, state);
+	M42TracePsDraw(buffer, state.color_info, state.color_count, state.ps_input_info);
 
 	if (draw_prim7_as_ngg && state.vs_input_info.buffers_num == 0 &&
 	    state.vs_input_info.param_export_mask == 0 && state.ps_input_info.input_num != 0) {

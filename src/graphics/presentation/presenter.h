@@ -23,6 +23,15 @@ public:
 	[[nodiscard]] Frame&         PrepareFrame(CommandBuffer& command, const ImageInfo& info);
 	[[nodiscard]] Frame&         PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
 	                                               CommandBuffer* producer = nullptr);
+	// m43g-intro probe (TEMPORARY, remove before commit): present host-side RGBA pixels
+	// directly (the guest's own video-frame draws never happen at emulator speed).
+	[[nodiscard]] Frame& PrepareHostFrame(const void* rgba, uint32_t width, uint32_t height);
+	// m42-present probe (TEMPORARY, remove before commit): present the cache image at a
+	// guest base address instead of the flip surface (G-buffer content is invisible to the
+	// CPU readback, GPU->GPU copy is the only honest viewer). Falls back to the normal
+	// surface when the address does not resolve or its format cannot feed the frame.
+	[[nodiscard]] Frame& PrepareCacheFrame(CommandBuffer& command, const ImageInfo& info,
+	                                       uint64_t address, bool* substituted);
 	[[nodiscard]] Frame*         PrepareLastFrame();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;

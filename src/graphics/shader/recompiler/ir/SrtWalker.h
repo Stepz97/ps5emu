@@ -25,6 +25,11 @@ struct DescriptorSourceRequest {
 
 bool FoldScalarConstant(const ScalarProvenance& provenance, uint32_t value, uint32_t& result);
 
+// m42-wait probe (TEMPORARY, remove before commit): counts runtime walks that degraded at
+// least one flat slot, so the dispatch path can detect "this walk read a not-yet-written
+// table" and retry after waiting for the guest writer.
+uint64_t SrtWalkerDegradedWalkCount();
+
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.
 bool BuildSrtPlan(Program& program, std::string* error);

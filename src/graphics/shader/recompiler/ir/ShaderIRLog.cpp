@@ -245,6 +245,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BitFieldMaskU32: text += "BitFieldMaskU32"; break;
 		case Opcode::BitFieldMaskU64: text += "BitFieldMaskU64"; break;
 		case Opcode::BitFieldExtractU32: text += "BitFieldExtractU32"; break;
+		case Opcode::BitFieldExtractI32: text += "BitFieldExtractI32"; break;
 		case Opcode::BitFieldExtractU64: text += "BitFieldExtractU64"; break;
 		case Opcode::BitFieldExtract3U32: text += "BitFieldExtract3U32"; break;
 		case Opcode::BitFieldExtract3I32: text += "BitFieldExtract3I32"; break;

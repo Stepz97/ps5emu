@@ -111,6 +111,13 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // Pull a GPU image back into guest memory (see GpuResourceManager). Used by scan-out
 // instrumentation, which otherwise reads a buffer the renderer never writes.
 bool                   SynchronizeGpuImageToMemory(uint64_t vaddr, uint64_t size);
+// Pull GPU-modified buffer bytes back into guest memory (see GpuResourceManager). Used by
+// host-side shader-walk reads, which bypass the page-fault readback path.
+bool                   SynchronizeGpuBufferToMemory(uint64_t vaddr, uint64_t size);
+// True when any tracker page covering the range is GPU-modified (diagnostics).
+bool                   IsGpuBufferRegionModified(uint64_t vaddr, uint64_t size);
+// True when any tracker page covering the range is CPU-modified (guest wrote it).
+bool                   IsCpuBufferRegionModified(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 void               DumpGpuWatchedRanges(std::FILE* out) noexcept;

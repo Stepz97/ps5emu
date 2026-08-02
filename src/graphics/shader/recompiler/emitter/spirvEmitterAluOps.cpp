@@ -997,14 +997,26 @@ void EmitBitFieldExtractU64(EmitterState& state, const IR::Instruction& inst) {
 	EmitStoreU32(state, OffsetRegisterOperand(inst.dst, 1), ret_high);
 }
 
-void EmitBitFieldExtractU32(EmitterState& state, const IR::Instruction& inst) {
+void EmitBitFieldExtractU32(EmitterState& state, const IR::Instruction& inst, bool signed_value) {
 	const auto src    = EmitValueLoad(state, inst.src[0]);
 	const auto field  = EmitValueLoad(state, inst.src[1]);
 	const auto offset = EmitBitFieldExtractConstant(state, field, 0, 5);
 	const auto count  = EmitBitFieldExtractConstant(state, field, 16, 7);
-	const auto ret    = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitFieldUExtract, state.uint_type, ret, src, offset, count});
-	EmitStoreU32(state, inst.dst, ret);
+	if (!signed_value) {
+		const auto ret = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitFieldUExtract, state.uint_type, ret, src, offset, count});
+		EmitStoreU32(state, inst.dst, ret);
+		return;
+	}
+
+	const auto signed_src = state.builder.AllocateId();
+	const auto signed_ret = state.builder.AllocateId();
+	const auto result     = state.builder.AllocateId();
+	state.builder.AddFunction({OpBitcast, state.int_type, signed_src, src});
+	state.builder.AddFunction(
+	    {OpBitFieldSExtract, state.int_type, signed_ret, signed_src, offset, count});
+	state.builder.AddFunction({OpBitcast, state.uint_type, result, signed_ret});
+	EmitStoreU32(state, inst.dst, result);
 }
 
 void EmitBitFieldExtract3U32(EmitterState& state, const IR::Instruction& inst, bool signed_value) {

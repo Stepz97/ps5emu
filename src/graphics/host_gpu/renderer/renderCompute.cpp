@@ -23,12 +23,15 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -254,6 +257,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 			}
 		}
 	}
+	// m42-skip probe (TEMPORARY): dispatch whose SRT table was readable-but-empty smears
+	// black with zeroed parameters; skip it so healthy dispatches keep their output.
+	if (ShaderM42SkipDispatchRequested()) {
+		static std::atomic<uint32_t> skip_count {0};
+		const auto n = skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 16 || (n & 0x1ffu) == 0) {
+			LOGF("m42-skip: dropping compute dispatch with empty SRT table shader=0x%016" PRIx64
+			     " (n=%u)\n",
+			     cs_regs.cs_regs.data_addr, n);
+		}
+		ResetBindings();
+		return;
+	}
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
@@ -268,6 +284,242 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 		    return image.kind == ShaderRecompiler::IR::ResourceKind::Image ||
 		           image.kind == ShaderRecompiler::IR::ResourceKind::ImageUint;
 	    });
+	// m42-gbuf probe (TEMPORARY, remove before commit): the muro-42 "second key" candidate
+	// says the lighting CS reads its G-buffer inputs black. For the first rounds of every
+	// sampler-heavy CS, pull each sampled input image back to guest memory through the same
+	// machinery the scan-out dump already uses, sample the backing, and log max/nonzero so
+	// "inputs really black" vs "inputs have data, the key is elsewhere" is decided by
+	// measurement, not inference. Gated by KYTY_M42_GBUF_PROBE=1.
+	static const bool m42_gbuf_enabled = []() {
+		const char* v = std::getenv("KYTY_M42_GBUF_PROBE");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (m42_gbuf_enabled && sampled_images >= 8 &&
+	    resources.images.size() == program.info.images.size()) {
+		static Common::Mutex gbuf_mutex;
+		// (last_frame, count) per shader: rounds are spaced in time (one per shader every
+		// 256 frames) instead of a fixed budget, so the menu phase gets probed too — a
+		// flat cap burned all rounds during loading, whose descriptors are also real.
+		static std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> gbuf_rounds;
+		// Rounds are only consumed when the descriptors carry real bases: during the
+		// loading phase the SRT tables are empty and every sampled descriptor decodes to
+		// null, and burning the per-shader budget there would leave nothing for the menu
+		// phase, the one this probe exists to measure.
+		bool gbuf_any_base = false;
+		for (uint32_t i = 0; i < program.info.images.size() && !gbuf_any_base; i++) {
+			const auto& image = program.info.images[i];
+			const bool  is_sampled =
+			    image.kind == ShaderRecompiler::IR::ResourceKind::Image ||
+			    image.kind == ShaderRecompiler::IR::ResourceKind::ImageUint;
+			if (!is_sampled || image.written) {
+				continue;
+			}
+			gbuf_any_base =
+			    DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]).Base40() != 0;
+		}
+		if (!gbuf_any_base) {
+			static std::atomic<uint32_t> gbuf_null_logs {0};
+			if (gbuf_null_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("m42-gbuf: frame=%u shader=0x%016" PRIx64
+				     " all sampled descriptors null (empty SRT phase), round not consumed\n",
+				     frame_num, cs_regs.cs_regs.data_addr);
+			}
+		}
+		uint32_t gbuf_round = UINT32_MAX;
+		if (gbuf_any_base) {
+			Common::LockGuard gbuf_lock(gbuf_mutex);
+			auto [it, inserted] =
+			    gbuf_rounds.try_emplace(cs_regs.cs_regs.data_addr, std::pair {0u, 0u});
+			if (inserted || frame_num >= it->second.first + 256u) {
+				it->second.first = frame_num;
+				gbuf_round       = it->second.second++;
+			}
+		}
+		if (gbuf_round != UINT32_MAX) {
+			for (uint32_t i = 0; i < program.info.images.size(); i++) {
+				const auto& image      = program.info.images[i];
+				const bool  is_sampled =
+				    image.kind == ShaderRecompiler::IR::ResourceKind::Image ||
+				    image.kind == ShaderRecompiler::IR::ResourceKind::ImageUint;
+				if (image.written) {
+					// Output side of the dispatch: knowing WHERE the lighting writes is
+					// half of the downstream join (does the post chain / presenter read
+					// this base?).
+					const auto w =
+					    DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+					LOGF("m42-gbuf-out: frame=%u round=%u shader=0x%016" PRIx64
+					     " img[%u] base=0x%010" PRIx64 " fmt=%u %ux%u tile=%u\n",
+					     frame_num, gbuf_round, cs_regs.cs_regs.data_addr, i, w.Base40(),
+					     w.Format(), static_cast<uint32_t>(w.Width5()) + 1u,
+					     static_cast<uint32_t>(w.Height5()) + 1u, w.TileMode());
+					continue;
+				}
+				if (!is_sampled) {
+					continue;
+				}
+				const auto r = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+				const uint64_t base   = r.Base40();
+				const uint32_t width  = static_cast<uint32_t>(r.Width5()) + 1u;
+				const uint32_t height = static_cast<uint32_t>(r.Height5()) + 1u;
+				if (base == 0) {
+					LOGF("m42-gbuf: frame=%u round=%u shader=0x%016" PRIx64
+					     " img[%u] null descriptor\n",
+					     frame_num, gbuf_round, cs_regs.cs_regs.data_addr, i);
+					continue;
+				}
+				const uint64_t est_size = std::clamp<uint64_t>(
+				    static_cast<uint64_t>(width) * height * 4u, 0x1000u, 32u << 20u);
+				// gpumod=1 already IS the payload ("a GPU producer wrote this texture"):
+				// pulling the content would go through the readback download, which EXITs
+				// on tiled formats it cannot detile (fmt=5 tile=24, seen live killing the
+				// first probe boot). Bytes are only sampled when the tracker holds no
+				// GPU-side truth, where the raw backing read is fault-free and honest.
+				const bool gpu_mod =
+				    LibKernel::Memory::IsGpuBufferRegionModified(base, est_size);
+				std::array<uint8_t, 4096> gbuf_chunk {};
+				uint32_t                  max_byte = 0;
+				uint64_t                  nonzero  = 0;
+				uint64_t                  total    = 0;
+				if (!gpu_mod) {
+					for (uint32_t c = 0; c < 16; c++) {
+						const uint64_t offset = ((est_size * c) / 16u) & ~0xfffull;
+						if (!LibKernel::Memory::TryReadBacking(base + offset, gbuf_chunk.data(),
+						                                       gbuf_chunk.size())) {
+							continue;
+						}
+						for (const auto b: gbuf_chunk) {
+							max_byte = std::max<uint32_t>(max_byte, b);
+							nonzero += (b != 0 ? 1u : 0u);
+						}
+						total += gbuf_chunk.size();
+					}
+				}
+				LOGF("m42-gbuf: frame=%u round=%u shader=0x%016" PRIx64 " img[%u] base=0x%010" PRIx64
+				     " fmt=%u %ux%u tile=%u gpumod=%d max=%u nonzero=%.1f%% bytes=%" PRIu64 "\n",
+				     frame_num, gbuf_round, cs_regs.cs_regs.data_addr, i, base, r.Format(), width,
+				     height, r.TileMode(), gpu_mod ? 1 : 0, max_byte,
+				     total != 0 ? 100.0 * static_cast<double>(nonzero) / static_cast<double>(total)
+				                : 0.0,
+				     total);
+			}
+		}
+	}
+	// m42-trace probe (TEMPORARY, remove before commit): follow specific guest bases
+	// through the compute side of the frame graph. KYTY_M42_TRACE_BASES=hex,hex,... logs
+	// every dispatch that samples or writes a traced base (no minimum image count, unlike
+	// m42-gbuf), and for LINEAR traced images also pulls + samples the real content — the
+	// detile EXIT only bites tiled formats, and the exposure texture (48x27x64, tile=0)
+	// was already pulled safely by the first probe generation.
+	static const std::vector<uint64_t> m42_trace_bases = []() {
+		std::vector<uint64_t> bases;
+		if (const char* v = std::getenv("KYTY_M42_TRACE_BASES"); v != nullptr) {
+			const char* p = v;
+			while (*p != '\0') {
+				char*      end  = nullptr;
+				const auto base = std::strtoull(p, &end, 16);
+				if (end == p) {
+					break;
+				}
+				if (base != 0) {
+					bases.push_back(base);
+				}
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return bases;
+	}();
+	if (!m42_trace_bases.empty() && resources.images.size() == program.info.images.size() &&
+	    resources.buffers.size() == program.info.buffers.size()) {
+		static Common::Mutex                          trace_mutex;
+		static std::unordered_map<uint64_t, uint32_t> trace_last_frame;
+		bool trace_hit = false;
+		for (uint32_t i = 0; i < program.info.images.size() && !trace_hit; i++) {
+			const auto base =
+			    DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]).Base40();
+			trace_hit = base != 0 && std::find(m42_trace_bases.begin(), m42_trace_bases.end(),
+			                                   base) != m42_trace_bases.end();
+		}
+		if (trace_hit) {
+			bool trace_due = false;
+			{
+				Common::LockGuard trace_lock(trace_mutex);
+				auto& last = trace_last_frame[cs_regs.cs_regs.data_addr];
+				if (last == 0 || frame_num >= last + 128u) {
+					last      = std::max(frame_num, 1u);
+					trace_due = true;
+				}
+			}
+			if (trace_due) {
+				LOGF("m42-trace: frame=%u shader=0x%016" PRIx64 " groups=%ux%ux%u textures=%zu "
+				     "buffers=%zu\n",
+				     frame_num, cs_regs.cs_regs.data_addr, thread_group_x, thread_group_y,
+				     thread_group_z, program.info.images.size(), program.info.buffers.size());
+				for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+					const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+					LOGF("m42-trace:   buf[%u] usage=%s addr=0x%012" PRIx64 " stride=%u records=%u\n",
+					     i, program.info.buffers[i].written ? "read-write" : "read-only", r.Base48(),
+					     r.Stride(), r.NumRecords());
+					const uint64_t bufsize =
+					    static_cast<uint64_t>(r.Stride()) * r.NumRecords();
+					if (r.Base48() != 0 && bufsize > 0 && bufsize <= 256) {
+						std::array<uint8_t, 256> raw {};
+						if (LibKernel::Memory::TryReadBacking(r.Base48(), raw.data(), bufsize)) {
+							char hex[3 * 32 + 1] = {};
+							const auto n = std::min<uint64_t>(bufsize, 32);
+							for (uint64_t b = 0; b < n; b++) {
+								std::snprintf(hex + b * 3, 4, "%02x ", raw[b]);
+							}
+							float f[8] = {};
+							std::memcpy(f, raw.data(), std::min<uint64_t>(bufsize, sizeof(f)));
+							LOGF("m42-trace:     content hex=[%s] f32=[%g %g %g %g %g %g %g %g]\n",
+							     hex, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+						}
+					}
+				}
+				for (uint32_t i = 0; i < program.info.images.size(); i++) {
+					const auto r = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+					const uint64_t base   = r.Base40();
+					const uint32_t width  = static_cast<uint32_t>(r.Width5()) + 1u;
+					const uint32_t height = static_cast<uint32_t>(r.Height5()) + 1u;
+					const uint32_t depth  = static_cast<uint32_t>(r.Depth()) + 1u;
+					uint32_t max_byte = 0;
+					uint64_t nonzero  = 0;
+					uint64_t total    = 0;
+					if (base != 0 && r.TileMode() == 0) {
+						const uint64_t est = std::clamp<uint64_t>(
+						    static_cast<uint64_t>(width) * height * std::max(depth, 1u) * 4u, 0x1000u,
+						    32u << 20u);
+						(void)LibKernel::Memory::SynchronizeGpuImageToMemory(base, est);
+						std::array<uint8_t, 4096> chunk {};
+						for (uint32_t c = 0; c < 16; c++) {
+							const uint64_t offset = ((est * c) / 16u) & ~0xfffull;
+							if (!LibKernel::Memory::TryReadBacking(base + offset, chunk.data(),
+							                                       chunk.size())) {
+								continue;
+							}
+							for (const auto b: chunk) {
+								max_byte = std::max<uint32_t>(max_byte, b);
+								nonzero += (b != 0 ? 1u : 0u);
+							}
+							total += chunk.size();
+						}
+					}
+					LOGF("m42-trace:   img[%u] usage=%s sampled=%d base=0x%010" PRIx64
+					     " fmt=%u %ux%ux%u tile=%u max=%u nonzero=%.1f%% bytes=%" PRIu64 "\n",
+					     i, program.info.images[i].written ? "read-write" : "read-only",
+					     (program.info.images[i].kind == ShaderRecompiler::IR::ResourceKind::Image ||
+					      program.info.images[i].kind == ShaderRecompiler::IR::ResourceKind::ImageUint)
+					         ? 1
+					         : 0,
+					     base, r.Format(), width, height, depth, r.TileMode(), max_byte,
+					     total != 0
+					         ? 100.0 * static_cast<double>(nonzero) / static_cast<double>(total)
+					         : 0.0,
+					     total);
+				}
+			}
+		}
+	}
 	const bool                   has_sampler = !program.info.samplers.empty();
 	static std::atomic<uint32_t> dispatch_log_count {0};
 	if ((large_workgroup || has_sampler) &&

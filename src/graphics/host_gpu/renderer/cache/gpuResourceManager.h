@@ -34,6 +34,16 @@ public:
 	// InvalidateMemory, and the only way instrumentation outside the renderer can look at
 	// what was actually drawn: the guest scan-out buffer is never written otherwise.
 	[[nodiscard]] bool SynchronizeImageToMemory(uint64_t vaddr, uint64_t size);
+	// Pull GPU-modified buffer bytes covering this range back into guest memory. The buffer
+	// twin of SynchronizeImageToMemory: GPU-produced tables (e.g. SRT chains written by an
+	// earlier dispatch) live in cached buffers the CPU backing has never seen, and any host
+	// read that bypasses the fault path (shader-walk reads) sees stale zeros otherwise.
+	// No-op unless the containing tracker pages are GPU-modified.
+	[[nodiscard]] bool SynchronizeBufferToMemory(uint64_t vaddr, uint64_t size);
+	// True when any tracker page covering the range is GPU-modified (diagnostics).
+	[[nodiscard]] bool IsBufferRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// True when any tracker page covering the range is CPU-modified (guest wrote it).
+	[[nodiscard]] bool IsBufferRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);

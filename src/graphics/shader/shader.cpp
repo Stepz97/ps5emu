@@ -17,15 +17,19 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.h"
 #include "spirv-tools/libspirv.hpp"
 #include "spirv-tools/optimizer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <thread>
 #include <fmt/format.h>
 #include <memory>
 #include <mutex>
@@ -217,6 +221,145 @@ static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 	return nullptr;
 }
 
+// m42-state probe (TEMPORARY, remove before commit): remembers the last successfully read
+// walk address per thread so a failed chase (the muro-42 signature is +0x18 off a zero
+// slot) can report the tracker state of the table that produced the zero pointer.
+static thread_local uint64_t t_last_walk_read_address = 0;
+
+// m42-replay probe (TEMPORARY, remove before commit): while armed, reads inside the armed
+// table window are served from the watcher's last non-empty snapshot instead of the (now
+// recycled/empty) guest memory. Armed only around the single retry materialization.
+static thread_local uint64_t                 t_m42_replay_base = 0;
+static thread_local std::array<uint8_t, 128> t_m42_replay_data {};
+
+// m42-watch probe (TEMPORARY, remove before commit): self-registering write watcher over
+// the SRT tables that degrade. Polls the guest backing from a helper thread and logs every
+// content transition, to tell "nobody ever writes the table" apart from "the table is
+// written and re-zeroed before the dispatch executes" (ring recycling). Addresses are
+// discovered at failure time, never hardcoded.
+namespace {
+class M42WatchProbe {
+public:
+	[[nodiscard]] uint64_t Transitions() const {
+		return m_transitions.load(std::memory_order_relaxed);
+	}
+
+	// Returns the last non-empty content the poller saw for the table window containing
+	// this address (the "photocopy of the last letter"), if any.
+	bool LastFilled(uint64_t table_addr, std::array<uint8_t, 128>& out) {
+		const uint64_t base = table_addr & ~uint64_t {0x3F};
+		std::lock_guard lock(m_snapshot_mutex);
+		for (size_t i = 0; i < kSlots; i++) {
+			if (m_slots[i].load(std::memory_order_relaxed) == base && m_snapshot_valid[i]) {
+				out = m_snapshots[i];
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void Register(uint64_t table_addr) {
+		if (table_addr == 0) {
+			return;
+		}
+		const uint64_t base = table_addr & ~uint64_t {0x3F};
+		for (auto& slot: m_slots) {
+			const auto current = slot.load(std::memory_order_relaxed);
+			if (current == base) {
+				return;
+			}
+			if (current == 0) {
+				uint64_t expected = 0;
+				if (slot.compare_exchange_strong(expected, base, std::memory_order_relaxed)) {
+					std::fprintf(stderr, "m42-watch: watching table window 0x%016llx\n",
+					             static_cast<unsigned long long>(base));
+					Start();
+					return;
+				}
+			}
+		}
+	}
+
+private:
+	static constexpr size_t kSlots      = 64;
+	static constexpr size_t kWindow     = 128;
+	static constexpr int    kMaxLogs    = 200;
+
+	void Start() {
+		bool expected = false;
+		if (!m_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+			return;
+		}
+		std::thread([this] { Poll(); }).detach();
+	}
+
+	void Poll() {
+		const auto origin = std::chrono::steady_clock::now();
+		std::array<std::array<uint8_t, kWindow>, kSlots> previous {};
+		std::array<bool, kSlots>                         primed {};
+		std::array<int, kSlots>                          logged {};
+		for (;;) {
+			for (size_t i = 0; i < kSlots; i++) {
+				const auto base = m_slots[i].load(std::memory_order_relaxed);
+				if (base == 0) {
+					continue;
+				}
+				std::array<uint8_t, kWindow> current {};
+				if (!Libs::LibKernel::Memory::TryReadBacking(base, current.data(),
+				                                             current.size())) {
+					continue;
+				}
+				const bool now_filled =
+				    std::any_of(current.begin(), current.end(), [](uint8_t b) { return b != 0; });
+				if (now_filled) {
+					std::lock_guard lock(m_snapshot_mutex);
+					m_snapshots[i]      = current;
+					m_snapshot_valid[i] = true;
+				}
+				if (primed[i] && logged[i] < kMaxLogs &&
+				    std::memcmp(current.data(), previous[i].data(), kWindow) != 0) {
+					m_transitions.fetch_add(1, std::memory_order_relaxed);
+					logged[i]++;
+					const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+					                         std::chrono::steady_clock::now() - origin)
+					                         .count();
+					const auto dump_words = [](const char* tag, uint64_t addr, long long ms,
+					                           const uint8_t* bytes) {
+						uint32_t words[kWindow / 4] {};
+						std::memcpy(words, bytes, kWindow);
+						char line[kWindow / 4 * 9 + 1] = {};
+						for (size_t w = 0; w < kWindow / 4; w++) {
+							std::snprintf(line + w * 9, 10, "%08x ", words[w]);
+						}
+						std::fprintf(stderr, "m42-watch: t=%lldms table=0x%016llx %s %s\n", ms,
+						             static_cast<unsigned long long>(addr), tag, line);
+					};
+					dump_words("old", base, static_cast<long long>(elapsed),
+					           previous[i].data());
+					dump_words("new", base, static_cast<long long>(elapsed), current.data());
+					if (logged[i] == kMaxLogs) {
+						std::fprintf(stderr,
+						             "m42-watch: table=0x%016llx last log for this table\n",
+						             static_cast<unsigned long long>(base));
+					}
+				}
+				previous[i] = current;
+				primed[i]   = true;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+	}
+
+	std::array<std::atomic<uint64_t>, kSlots> m_slots {};
+	std::atomic<bool>                         m_started {false};
+	std::atomic<uint64_t>                     m_transitions {0};
+	std::mutex                                m_snapshot_mutex;
+	std::array<std::array<uint8_t, kWindow>, kSlots> m_snapshots {};
+	std::array<bool, kSlots>                         m_snapshot_valid {};
+};
+M42WatchProbe g_m42_watch;
+} // namespace
+
 bool ShaderReadGuestMemory(void* /*userdata*/, uint64_t address, uint32_t* value) {
 	// Same semantics as the historical direct host read (page-protection faults still drive
 	// the memory tracker), but unmapped addresses fail instead of faulting — the approximate
@@ -224,9 +367,48 @@ bool ShaderReadGuestMemory(void* /*userdata*/, uint64_t address, uint32_t* value
 	uint64_t mapped = 0;
 	if (!HostMemoryQueryRange(address, sizeof(*value), HostMemoryAccess::Mapped, mapped) ||
 	    mapped < sizeof(*value)) {
+		// m42-state probe (TEMPORARY, remove before commit).
+		g_m42_watch.Register(t_last_walk_read_address);
+		static std::atomic<uint32_t> fail_count {0};
+		if (fail_count.fetch_add(1, std::memory_order_relaxed) < 24) {
+			const auto last = t_last_walk_read_address;
+			std::fprintf(stderr,
+			             "m42-state: walk read failed addr=0x%016llx last_ok=0x%016llx "
+			             "last_ok_gpu_modified=%d\n",
+			             static_cast<unsigned long long>(address),
+			             static_cast<unsigned long long>(last),
+			             (last != 0 &&
+			              Libs::LibKernel::Memory::IsGpuBufferRegionModified(last, sizeof(*value)))
+			                 ? 1
+			                 : 0);
+		}
 		return false;
 	}
+	// m42-replay probe (TEMPORARY): serve the armed snapshot window before touching memory.
+	if (t_m42_replay_base != 0 && address >= t_m42_replay_base &&
+	    address + sizeof(*value) <= t_m42_replay_base + t_m42_replay_data.size()) {
+		std::memcpy(value, t_m42_replay_data.data() + (address - t_m42_replay_base),
+		            sizeof(*value));
+		return true;
+	}
+	// GPU-produced tables (SRT chains filled by an earlier dispatch) live in cached buffers
+	// the CPU backing has never seen; pull them back before reading or the walk sees stale
+	// zeros (muro 42). No-op unless the containing tracker pages are GPU-modified.
+	// Opt-in via KYTY_M42_PULL=1 while its interaction with the present path is bisected
+	// (suspect in the menu dither blackout of Aug 2).
+	static const bool pull_enabled = std::getenv("KYTY_M42_PULL") != nullptr;
+	if (pull_enabled &&
+	    Libs::LibKernel::Memory::SynchronizeGpuBufferToMemory(address, sizeof(*value))) {
+		static std::atomic<uint32_t> pull_count {0};
+		const auto count = pull_count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (count <= 40 || (count & 0x3ffu) == 0) {
+			LOGF("srt-readback: pulled GPU buffer bytes for a shader walk read "
+			     "addr=0x%016" PRIx64 " count=%" PRIu32 "\n",
+			     address, count);
+		}
+	}
 	std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+	t_last_walk_read_address = address; // m42-state probe (TEMPORARY, remove before commit)
 	return true;
 }
 
@@ -965,15 +1147,161 @@ static bool TryUsePixelPermutation(const ShaderProgramPermutation& permutation,
 	return true;
 }
 
+// m42-wait probe (TEMPORARY, remove before commit): the guest writes the SRT parameter
+// table in short-lived cycles (measured: filled ~1.6s out of every ~20s) and the emulator's
+// slow command processor usually materializes the dispatch while the table is in its empty
+// phase. When a compute walk degraded flat slots AND its user-SGPR base points at an
+// all-zero readable table, wait (bounded) for the guest writer and re-materialize once.
+static bool M42WaitForSrtTable(const HW::ComputeShaderInfo& regs, uint64_t shader_hash) {
+	if (regs.cs_regs.user_sgpr < 2) {
+		return false;
+	}
+	const uint64_t base = static_cast<uint64_t>(regs.cs_user_sgpr.value[0]) |
+	                      (static_cast<uint64_t>(regs.cs_user_sgpr.value[1]) << 32u);
+	if (base == 0) {
+		return false;
+	}
+	// No writer has ever touched a watched table yet (intro/loading phases): there is no
+	// mailman on the street, so waiting can only stall the boot. The watcher unlocks the
+	// waits the moment it sees the first real write cycle.
+	if (g_m42_watch.Transitions() == 0) {
+		return false;
+	}
+	const auto table_empty = [base] {
+		for (uint64_t i = 0; i < 32; i++) {
+			uint32_t value = 0;
+			if (!ShaderReadGuestMemory(nullptr, base + i * 4, &value)) {
+				return false; // unreadable -> not our case, do not wait
+			}
+			if (value != 0) {
+				return false;
+			}
+		}
+		return true;
+	};
+	// m42-replay stats (TEMPORARY): how many degraded compute walks saw their table filled
+	// vs empty at materialization time - the number that decides whether the black screen
+	// can still be blamed on empty tables at all.
+	static std::atomic<uint32_t> degraded_filled {0};
+	static std::atomic<uint32_t> degraded_empty {0};
+	const bool                   empty = table_empty();
+	const auto                   total = (empty ? degraded_empty : degraded_filled)
+	                       .fetch_add(1, std::memory_order_relaxed) +
+	                   1 + (empty ? degraded_filled : degraded_empty).load(std::memory_order_relaxed);
+	if ((total % 500) == 0) {
+		std::fprintf(stderr, "m42-stats: degraded walks so far: table_filled=%u table_empty=%u\n",
+		             degraded_filled.load(std::memory_order_relaxed),
+		             degraded_empty.load(std::memory_order_relaxed));
+	}
+	if (!empty) {
+		return false; // table already has data (or is not a table) - nothing to wait for
+	}
+	// m42-replay: DANGEROUS by default (a stale snapshot can carry pointers into recycled
+	// memory - crashed boot 184 at 0x80000018). Opt-in only.
+	static const bool replay_on = std::getenv("KYTY_M42_REPLAY") != nullptr;
+	if (!replay_on) {
+		return false;
+	}
+	if (!g_m42_watch.LastFilled(base, t_m42_replay_data)) {
+		return false;
+	}
+	t_m42_replay_base = base & ~uint64_t {0x3F};
+	static std::atomic<uint32_t> replay_count {0};
+	const auto count = replay_count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count <= 64 || (count & 0xffu) == 0) {
+		std::fprintf(stderr,
+		             "m42-replay: serving cached snapshot of table 0x%016llx for shader "
+		             "0x%016llx (count=%u)\n",
+		             static_cast<unsigned long long>(t_m42_replay_base),
+		             static_cast<unsigned long long>(shader_hash), count);
+	}
+	return true;
+}
+
+// m42-skip probe (TEMPORARY, remove before commit): a compute dispatch whose SRT table is
+// readable but all-zero runs with zeroed parameters and smears black over what the healthy
+// dispatches produced. With KYTY_M42_SKIP_EMPTY=1 those dispatches are skipped entirely
+// (SharpEmu ships the sibling mitigation in production, their PR #528).
+thread_local bool t_m42_skip_dispatch = false;
+
+bool ShaderM42SkipDispatchRequested() {
+	return t_m42_skip_dispatch;
+}
+
+bool ShaderM42UserTableIsEmpty(const uint32_t* user_sgpr, uint32_t count) {
+	if (user_sgpr == nullptr || count < 2) {
+		return false;
+	}
+	const uint64_t base =
+	    static_cast<uint64_t>(user_sgpr[0]) | (static_cast<uint64_t>(user_sgpr[1]) << 32u);
+	if (base == 0) {
+		return false;
+	}
+	for (uint64_t i = 0; i < 32; i++) {
+		uint32_t value = 0;
+		if (!ShaderReadGuestMemory(nullptr, base + i * 4, &value)) {
+			return false;
+		}
+		if (value != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool M42TableIsEmpty(const HW::ComputeShaderInfo& regs) {
+	if (regs.cs_regs.user_sgpr < 2) {
+		return false;
+	}
+	const uint64_t base = static_cast<uint64_t>(regs.cs_user_sgpr.value[0]) |
+	                      (static_cast<uint64_t>(regs.cs_user_sgpr.value[1]) << 32u);
+	if (base == 0) {
+		return false;
+	}
+	for (uint64_t i = 0; i < 32; i++) {
+		uint32_t value = 0;
+		if (!ShaderReadGuestMemory(nullptr, base + i * 4, &value)) {
+			return false;
+		}
+		if (value != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool TryUseComputePermutation(const ShaderProgramPermutation& permutation,
                                      const HW::ComputeShaderInfo&    regs,
                                      ShaderComputeInputInfo& info, uint64_t shader_hash) {
 	std::string error;
+	t_m42_skip_dispatch = false; // m42-skip probe (TEMPORARY)
+	const auto  degraded_before =
+	    ShaderRecompiler::IR::SrtWalkerDegradedWalkCount(); // m42-wait probe (TEMPORARY)
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
 	        std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr),
 	        regs.cs_regs.data_addr, info.stage, &error, ShaderReadGuestMemory)) {
 		return LogPermutationMismatch(permutation, "CS", shader_hash, error);
+	}
+	// m42-replay probe (TEMPORARY): degraded walk over an all-zero table -> retry against
+	// the watcher's cached snapshot of the last filled state, then disarm the window.
+	if (ShaderRecompiler::IR::SrtWalkerDegradedWalkCount() != degraded_before) {
+		static const bool skip_empty = std::getenv("KYTY_M42_SKIP_EMPTY") != nullptr;
+		if (skip_empty && M42TableIsEmpty(regs)) {
+			t_m42_skip_dispatch = true; // m42-skip probe (TEMPORARY)
+			return true;
+		}
+		if (M42WaitForSrtTable(regs, shader_hash)) {
+			std::string retry_error;
+			const bool  retry_ok = ShaderMaterializeStageRuntime(
+                permutation.program,
+                std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr),
+                regs.cs_regs.data_addr, info.stage, &retry_error, ShaderReadGuestMemory);
+			t_m42_replay_base = 0; // disarm before any other walk can see the snapshot
+			if (!retry_ok) {
+				return LogPermutationMismatch(permutation, "CS", shader_hash, retry_error);
+			}
+		}
 	}
 	return true;
 }

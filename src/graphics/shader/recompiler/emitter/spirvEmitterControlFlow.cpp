@@ -465,7 +465,8 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::FindMsbFromHighU64: EmitFindMsbFromHighU64(state, inst); break;
 		case IR::Opcode::BitFieldMaskU32: EmitBitFieldMaskU32(state, inst); break;
 		case IR::Opcode::BitFieldMaskU64: EmitBitFieldMaskU64(state, inst); break;
-		case IR::Opcode::BitFieldExtractU32: EmitBitFieldExtractU32(state, inst); break;
+		case IR::Opcode::BitFieldExtractU32: EmitBitFieldExtractU32(state, inst, false); break;
+		case IR::Opcode::BitFieldExtractI32: EmitBitFieldExtractU32(state, inst, true); break;
 		case IR::Opcode::BitFieldExtractU64: EmitBitFieldExtractU64(state, inst); break;
 		case IR::Opcode::BitFieldExtract3U32: EmitBitFieldExtract3U32(state, inst, false); break;
 		case IR::Opcode::BitFieldExtract3I32: EmitBitFieldExtract3U32(state, inst, true); break;

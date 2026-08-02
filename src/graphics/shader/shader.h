@@ -223,6 +223,11 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 // Validating SrtMemoryReader over the guest memory backing: fails instead of faulting on
 // unmapped addresses, which the approximate window-anchor evaluation depends on.
 bool ShaderReadGuestMemory(void* userdata, uint64_t address, uint32_t* value);
+// m42-skip probe (TEMPORARY, remove before commit)
+bool ShaderM42SkipDispatchRequested();
+// m42-queue-wait probe (TEMPORARY, remove before commit): true when the first 128 bytes at
+// the table pointed by user SGPR pair [0,1] are readable and all zero.
+bool ShaderM42UserTableIsEmpty(const uint32_t* user_sgpr, uint32_t count);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

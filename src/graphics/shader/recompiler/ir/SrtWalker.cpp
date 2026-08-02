@@ -4,11 +4,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <fmt/format.h>
 #include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+// m42-wait probe (TEMPORARY, remove before commit)
+static std::atomic<uint64_t> g_m42_degraded_walks {0};
+uint64_t SrtWalkerDegradedWalkCount() {
+	return g_m42_degraded_walks.load(std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
@@ -781,6 +789,7 @@ static bool EvaluateRuntimeSourcesImpl(const Program&                           
 			}
 		}
 		if (failed_slots != 0) {
+			g_m42_degraded_walks.fetch_add(1, std::memory_order_relaxed); // m42-wait probe (TEMPORARY)
 			fprintf(stderr, "srt-walk: hash=0x%016" PRIx64 " %u flat slot(s) unreadable -> 0 (%s)\n",
 			        program.shader_hash, failed_slots, first_failure.c_str());
 		}

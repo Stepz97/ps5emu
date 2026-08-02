@@ -17,6 +17,13 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "kernel/memory.h"
+
+// m43g-intro probe (TEMPORARY, remove before commit)
+namespace Libs::Audio::AvPlayer {
+bool HostMovieAcquire(std::vector<uint8_t>& out, uint32_t& width, uint32_t& height,
+                      uint64_t& last_seq);
+bool HostMovieActive();
+} // namespace Libs::Audio::AvPlayer
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -595,6 +602,19 @@ static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 	if (path.empty()) {
 		return;
 	}
+	// KYTY_SCANOUT_SAMPLE=N keeps the dump alive on long boots: instead of one readback
+	// per flip (which crushes the frame rate), only every Nth prepared flip pays for the
+	// GPU pull. The file still always holds the most recent sampled frame.
+	static const uint32_t sample_every = [] {
+		const char* value = std::getenv("KYTY_SCANOUT_SAMPLE");
+		return value != nullptr ? static_cast<uint32_t>(std::atoi(value)) : 0u;
+	}();
+	if (sample_every > 1) {
+		static std::atomic<uint32_t> flip_counter {0};
+		if ((flip_counter.fetch_add(1, std::memory_order_relaxed) % sample_every) != 0) {
+			return;
+		}
+	}
 
 	// Overwrite on every flip so the file always holds the latest presented frame (the
 	// first frame of a real title is usually a black fade-in).
@@ -1147,7 +1167,95 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info);
+		// CPU-composed presentation (video playback writes the scan-out surface with plain
+		// guest stores) over a range that still holds stale GPU bytes from earlier renders:
+		// the upload source policy favors the GPU copy while ANY byte of the range stays
+		// GPU-owned, so the guest's pixels never reach the presented image. Hand ownership
+		// back to the guest before the cache decides which side to upload from. The
+		// condition only holds while both sides claim the range, and the invalidation
+		// clears the GPU side, so this costs one readback per ownership conflict - not one
+		// per flip - and never fires on the pure-GPU present path.
+		const auto scan_address = source_info.data.address;
+		const auto scan_size    = source_info.data.size;
+		if (Libs::LibKernel::Memory::IsCpuBufferRegionModified(scan_address, scan_size) &&
+		    Libs::LibKernel::Memory::IsGpuBufferRegionModified(scan_address, scan_size)) {
+			static std::atomic<uint32_t> handoff_count {0};
+			const auto count = handoff_count.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (count <= 16 || (count & 0xffu) == 0) {
+				LOGF("video-out: CPU/GPU ownership conflict on scan-out 0x%016" PRIx64
+				     " size=0x%" PRIx64 ", handing the range back to the guest (count=%u)\n",
+				     scan_address, scan_size, count);
+			}
+			Libs::LibKernel::Memory::InvalidateMemory(scan_address, scan_size);
+		}
+		// m43g-intro probe (TEMPORARY): while the guest is playing a video it never draws
+		// (frames dropped by its internal clock at emulator speed), present the decoder's
+		// own frames directly. Enabled with KYTY_M43_HOST_MOVIE=1.
+		static const bool           host_movie = std::getenv("KYTY_M43_HOST_MOVIE") != nullptr;
+		static std::vector<uint8_t> hm_rgba;
+		static uint32_t             hm_w = 0, hm_h = 0;
+		static uint64_t             hm_seq = 0;
+		bool                        hm_present = false;
+		if (host_movie) {
+			(void)Libs::Audio::AvPlayer::HostMovieAcquire(hm_rgba, hm_w, hm_h, hm_seq);
+			// Only while the movie is actually playing: once it stops, hand the screen back
+			// to the guest immediately (a frozen last frame was masking the menu).
+			hm_present = Libs::Audio::AvPlayer::HostMovieActive() && hm_seq != 0 &&
+			             !hm_rgba.empty();
+			if (hm_present && (hm_seq % 60) == 1) {
+				const char* tmp_path = "/Users/studio/Developer/ps5emu/hostmovie.ppm.tmp";
+				if (auto* f = std::fopen(tmp_path, "wb"); f != nullptr) {
+					std::fprintf(f, "P6\n%u %u\n255\n", hm_w, hm_h);
+					for (uint64_t i = 0; i < static_cast<uint64_t>(hm_w) * hm_h; i++) {
+						std::fwrite(hm_rgba.data() + i * 4, 1, 3, f);
+					}
+					std::fclose(f);
+					std::rename(tmp_path, "/Users/studio/Developer/ps5emu/hostmovie.ppm");
+				}
+			}
+		}
+		if (hm_present) {
+			static std::atomic<uint32_t> hm_count {0};
+			const auto n = hm_count.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (n <= 8 || (n & 0x3fu) == 0) {
+				LOGF("host-movie: presenting decoder frame seq=%llu %ux%u (n=%u)\n",
+				     static_cast<unsigned long long>(hm_seq), hm_w, hm_h, n);
+			}
+			frame = &m_presenter.PrepareHostFrame(hm_rgba.data(), hm_w, hm_h);
+		} else {
+			// m42-trace (TEMPORARY, remove before commit): name the real flip surface so
+			// the render-target census can be matched against the actual present target.
+			static const bool m42_trace_flip = std::getenv("KYTY_M42_TRACE_BASES") != nullptr;
+			if (m42_trace_flip) {
+				static std::atomic<uint32_t> m42_flip_n {0};
+				const auto fn = m42_flip_n.fetch_add(1, std::memory_order_relaxed);
+				if (fn < 4 || (fn & 0x7fu) == 0) {
+					LOGF("m42-flip: base=0x%010" PRIx64 " %ux%u bpb=%u\n",
+					     source_info.data.address, source_info.extent.width,
+					     source_info.extent.height, source_info.bytes_per_block);
+				}
+			}
+			// m42-present probe (TEMPORARY, remove before commit):
+			// KYTY_M42_PRESENT_BASE=<hex> presents the cache image at that guest base
+			// instead of the flip surface.
+			static const uint64_t m42_present_base = []() -> uint64_t {
+				const char* v = std::getenv("KYTY_M42_PRESENT_BASE");
+				return v != nullptr ? std::strtoull(v, nullptr, 16) : 0;
+			}();
+			if (m42_present_base != 0) {
+				bool substituted = false;
+				frame = &m_presenter.PrepareCacheFrame(buffer, source_info, m42_present_base,
+				                                       &substituted);
+				static std::atomic<uint32_t> m42_present_count {0};
+				const auto n = m42_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n <= 8 || (n & 0x3fu) == 0) {
+					LOGF("m42-present: base=0x%010" PRIx64 " substituted=%d (n=%u)\n",
+					     m42_present_base, substituted ? 1 : 0, n);
+				}
+			} else {
+				frame = &m_presenter.PrepareFrame(buffer, source_info);
+			}
+		}
 	}
 
 	Common::LockGuard lock(m_mutex);

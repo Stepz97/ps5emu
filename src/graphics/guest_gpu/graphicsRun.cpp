@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <unordered_map>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -1176,6 +1178,103 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	// m42-queue-wait probe (TEMPORARY, remove before commit): a compute dispatch whose SRT
+	// table is readable-but-all-zero lost the fill race against the guest CPU (the guest
+	// fills right after consuming an EOP written later by this same processor or a sibling
+	// queue - correlation measured across two boots). Suspend JUST this queue, exactly like
+	// WaitRegMem does (the cursor does not advance, the same packet re-runs next turn), so
+	// the round-robin keeps writing the EOPs the guest is waiting for. Bounded: after 64
+	// turns the dispatch runs with zeros, same as today. KYTY_M42_QUEUE_WAIT=1 enables it.
+	static const bool queue_wait = std::getenv("KYTY_M42_QUEUE_WAIT") != nullptr;
+	if (queue_wait) {
+		const auto& cs_probe = m_sh_ctx.GetCs();
+		static thread_local const void* retry_packet   = nullptr;
+		static thread_local uint32_t    retry_turns    = 0;
+		static thread_local uint64_t    retry_start_us = 0;
+		const void*                     current =
+		    (g_current_execution != nullptr && !g_current_execution->m_buffer_stack.empty())
+		                        ? static_cast<const void*>(
+                              g_current_execution->m_buffer_stack.back().next_packet)
+		                        : nullptr;
+		const bool empty =
+		    ShaderM42UserTableIsEmpty(cs_probe.cs_user_sgpr.value, cs_probe.cs_regs.user_sgpr);
+		// Epoch memory: one wait per table per cycle, not one per dispatch. A table that
+		// just gave up stays "hopeless" for 2 seconds; dispatches over it run with zeros
+		// immediately instead of re-paying the full patience each time.
+		static thread_local std::unordered_map<uint64_t, uint64_t> hopeless_until_us;
+		const uint64_t table_base =
+		    cs_probe.cs_regs.user_sgpr >= 2
+		        ? (static_cast<uint64_t>(cs_probe.cs_user_sgpr.value[0]) |
+		           (static_cast<uint64_t>(cs_probe.cs_user_sgpr.value[1]) << 32u))
+		        : 0;
+		const uint64_t now_epoch_us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(
+		        std::chrono::steady_clock::now().time_since_epoch())
+		        .count());
+		if (empty && table_base != 0) {
+			if (const auto it = hopeless_until_us.find(table_base);
+			    it != hopeless_until_us.end() && now_epoch_us < it->second) {
+				goto m42_queue_wait_done; // in a hopeless epoch: run with zeros, no wait
+			}
+		}
+		if (!empty && current != nullptr && current == retry_packet && retry_turns > 0) {
+			// The table filled while this queue yielded its turns: the race was won.
+			static std::atomic<uint32_t> success_count {0};
+			const auto sc = success_count.fetch_add(1, std::memory_order_relaxed) + 1;
+			const auto now_us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(
+			        std::chrono::steady_clock::now().time_since_epoch())
+			        .count());
+			if (sc <= 32 || (sc & 0xffu) == 0) {
+				LOGF("m42-queue-wait: SUCCESS, table filled after %" PRIu32 " turns / %" PRIu64
+				     " us cs=0x%016" PRIx64 " (n=%" PRIu32 ")\n",
+				     retry_turns, now_us - retry_start_us, cs_probe.cs_regs.data_addr, sc);
+			}
+			retry_packet = nullptr;
+			retry_turns  = 0;
+		}
+		if (empty) {
+			if (current != retry_packet) {
+				retry_packet   = current;
+				retry_turns    = 0;
+				retry_start_us = static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(
+				        std::chrono::steady_clock::now().time_since_epoch())
+				        .count());
+			}
+			static const uint32_t max_turns = [] {
+				const char* v = std::getenv("KYTY_M42_TURNS");
+				return v != nullptr ? static_cast<uint32_t>(std::atoi(v)) : 4096u;
+			}();
+			if (retry_turns < max_turns) {
+				retry_turns++;
+				static std::atomic<uint32_t> wait_count {0};
+				const auto n = wait_count.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n <= 16 || (n & 0x3ffu) == 0) {
+					LOGF("m42-queue-wait: empty SRT table, suspending queue (turn %" PRIu32
+					     ", total %" PRIu32 ") cs=0x%016" PRIx64 "\n",
+					     retry_turns, n, cs_probe.cs_regs.data_addr);
+				}
+				SuspendPm4();
+				return;
+			}
+			if (table_base != 0) {
+				hopeless_until_us[table_base] = now_epoch_us + 2000000; // 2s epoch
+			}
+			static std::atomic<uint32_t> giveup_count {0};
+			const auto g = giveup_count.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (g <= 16 || (g & 0xffu) == 0) {
+				const auto now_us = static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(
+				        std::chrono::steady_clock::now().time_since_epoch())
+				        .count());
+				LOGF("m42-queue-wait: table still empty after 4096 turns / %" PRIu64
+				     " us real, dispatching with zeros cs=0x%016" PRIx64 " (n=%" PRIu32 ")\n",
+				     now_us - retry_start_us, cs_probe.cs_regs.data_addr, g);
+			}
+		}
+	}
+m42_queue_wait_done:;
 	uint32_t frame_num = 0;
 	uint32_t local_x   = 1;
 	uint32_t local_y   = 1;

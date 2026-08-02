@@ -1273,7 +1273,7 @@ void EmitBitFieldMaskU64(EmitterState& state, const IR::Instruction& inst);
 
 void EmitBitFieldExtractU64(EmitterState& state, const IR::Instruction& inst);
 
-void EmitBitFieldExtractU32(EmitterState& state, const IR::Instruction& inst);
+void EmitBitFieldExtractU32(EmitterState& state, const IR::Instruction& inst, bool signed_value);
 
 void EmitBitFieldExtract3U32(EmitterState& state, const IR::Instruction& inst, bool signed_value);
 

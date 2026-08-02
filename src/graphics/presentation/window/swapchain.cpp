@@ -28,6 +28,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -61,6 +62,8 @@ namespace Libs::Graphics {
 struct Presenter::Frame {
 	VulkanImage                    image;
 	std::unique_ptr<CommandBuffer> present_commands;
+	std::unique_ptr<Buffer>        host_staging; // m43g-intro probe (TEMPORARY)
+	uint64_t                       host_staging_size = 0;
 	bool                           busy         = false;
 	bool                           reusing_last = false;
 
@@ -68,6 +71,9 @@ struct Presenter::Frame {
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
+	// m43g-intro probe (TEMPORARY, remove before commit)
+	void UploadFrom(CommandBuffer& command, vk::Buffer source, uint64_t offset, uint32_t width,
+	                uint32_t height);
 };
 
 class FramePool final {
@@ -306,6 +312,21 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+}
+
+// m43g-intro probe (TEMPORARY, remove before commit)
+void Presenter::Frame::UploadFrom(CommandBuffer& command_buffer, vk::Buffer source,
+                                  uint64_t offset, uint32_t width, uint32_t height) {
+	command_buffer.EndRendering();
+	auto command = command_buffer.Handle();
+	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
+	vk::BufferImageCopy copy {};
+	copy.bufferOffset     = offset;
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.imageExtent      = {std::min(width, image.extent.width),
+	                         std::min(height, image.extent.height), 1};
+	command.copyBufferToImage(source, image.image, vk::ImageLayout::eTransferDstOptimal, copy);
 	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
 }
 
@@ -738,6 +759,60 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	return *frame;
 }
 
+// m42-present probe (TEMPORARY, remove before commit): substitute the presented frame with
+// the cache image whose guest base is `address`. Single Acquire + single renderer lock so
+// the fallback path never leaks a frame from the pool nor races the cache (the image
+// reference is only used while the lock is held). The format-feature vetting mirrors
+// Frame::Configure's requirements: without it, an unsupported G-buffer format would EXIT
+// the whole boot instead of degrading to the normal surface.
+Presenter::Frame& Presenter::PrepareCacheFrame(CommandBuffer& buffer, const ImageInfo& info,
+                                               uint64_t address, bool* substituted) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(buffer.IsInvalid());
+	if (substituted != nullptr) {
+		*substituted = false;
+	}
+	auto*             frame = m_impl->frames.Acquire();
+	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	auto&             cache = m_impl->renderer.GetTextureCache();
+	if (const auto id = cache.FindImageFromRange(address, 0x1000, /*ensure_valid=*/false); id) {
+		auto&      image  = cache.GetImage(id);
+		const auto format = image.backing.format;
+		const auto extent =
+		    vk::Extent2D {image.backing.extent.width, image.backing.extent.height};
+		const auto features =
+		    m_impl->window.graphic_ctx.GetFormatProperties(format).optimalTilingFeatures;
+		const auto required = vk::FormatFeatureFlagBits::eBlitSrc |
+		                      vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
+		                      vk::FormatFeatureFlagBits::eTransferSrc |
+		                      vk::FormatFeatureFlagBits::eTransferDst;
+		if (format != vk::Format::eUndefined && extent.width != 0 && extent.height != 0 &&
+		    (features & required) == required) {
+			frame->Configure(m_impl->window.graphic_ctx, extent, format);
+			frame->CopyFrom(buffer, image);
+			if (substituted != nullptr) {
+				*substituted = true;
+			}
+			return *frame;
+		}
+	}
+	// Fallback: the normal surface path, on the already-acquired frame.
+	auto& image = m_impl->ResolveSurface(info);
+	if (image.backing.format == vk::Format::eUndefined) {
+		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
+	}
+	auto frame_format = info.pixel_format;
+	switch (frame_format) {
+		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
+		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
+		default: break;
+	}
+	frame->Configure(m_impl->window.graphic_ctx,
+	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
+	frame->CopyFrom(buffer, image);
+	return *frame;
+}
+
 Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
                                                CommandBuffer* producer) {
 	KYTY_PROFILER_FUNCTION();
@@ -761,6 +836,34 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		command.End();
 		command.Execute();
 	}
+	return *frame;
+}
+
+// m43g-intro probe (TEMPORARY, remove before commit)
+Presenter::Frame& Presenter::PrepareHostFrame(const void* rgba, uint32_t width,
+                                              uint32_t height) {
+	auto*             frame = m_impl->frames.Acquire();
+	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	frame->Configure(m_impl->window.graphic_ctx, {width, height}, vk::Format::eR8G8B8A8Unorm);
+	const uint64_t size = static_cast<uint64_t>(width) * height * 4;
+	if (frame->present_commands == nullptr) {
+		frame->present_commands = std::make_unique<CommandBuffer>(m_impl->present_scheduler);
+	}
+	auto& command = *frame->present_commands;
+	// The frame fence also protects its private staging buffer: once the previous present
+	// of THIS frame completed, its staging is free to be rewritten.
+	command.WaitForFenceAndReset();
+	if (frame->host_staging == nullptr || frame->host_staging_size < size) {
+		frame->host_staging = std::make_unique<Buffer>(
+		    m_impl->window.graphic_ctx, m_impl->present_scheduler, MemoryUsage::Upload, 0,
+		    vk::BufferUsageFlagBits::eTransferSrc, size);
+		frame->host_staging_size = size;
+	}
+	frame->host_staging->Write(0, rgba, size);
+	command.Begin();
+	frame->UploadFrom(command, frame->host_staging->Handle(), 0, width, height);
+	command.End();
+	command.Execute();
 	return *frame;
 }
 
