@@ -32,6 +32,7 @@ bool HostMovieActive();
 #include <array>
 #include <list>
 #include <thread>
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1265,8 +1266,24 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			if (!m42_present_bases.empty()) {
 				bool     substituted = false;
 				uint64_t hit_base    = 0;
-				frame = &m_presenter.PrepareCacheFrame(buffer, source_info, m42_present_bases,
-				                                       &hit_base, &substituted);
+				// KYTY_M42_PRESENT_ROTATE=<n>: cycle the candidate list every n flips so one boot
+				// shows every candidate in turn, instead of one boot per address.
+				static const uint32_t rotate_every = []() -> uint32_t {
+					const char* v = std::getenv("KYTY_M42_PRESENT_ROTATE");
+					return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0;
+				}();
+				static std::atomic<uint32_t> rotate_tick {0};
+				std::vector<uint64_t>        rotated;
+				if (rotate_every != 0 && m42_present_bases.size() > 1) {
+					const auto n = rotate_tick.fetch_add(1, std::memory_order_relaxed);
+					const auto pick = (n / rotate_every) % m42_present_bases.size();
+					rotated.push_back(m42_present_bases[pick]);
+				}
+				frame = &m_presenter.PrepareCacheFrame(
+				    buffer, source_info,
+				    rotated.empty() ? std::span<const uint64_t> {m42_present_bases}
+				                    : std::span<const uint64_t> {rotated},
+				    &hit_base, &substituted);
 				static std::atomic<uint32_t> m42_present_count {0};
 				static std::atomic<uint32_t> m42_present_hits {0};
 				const auto n = m42_present_count.fetch_add(1, std::memory_order_relaxed) + 1;

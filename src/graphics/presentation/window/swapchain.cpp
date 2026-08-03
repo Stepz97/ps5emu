@@ -809,6 +809,9 @@ Presenter::Frame& Presenter::PrepareCacheFrame(CommandBuffer& buffer, const Imag
 			if (substituted != nullptr) {
 				*substituted = true;
 			}
+			if (hit_address != nullptr) {
+				*hit_address = address;
+			}
 			return *frame;
 		}
 	}
