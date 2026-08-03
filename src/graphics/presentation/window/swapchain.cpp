@@ -766,16 +766,32 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 // Frame::Configure's requirements: without it, an unsupported G-buffer format would EXIT
 // the whole boot instead of degrading to the normal surface.
 Presenter::Frame& Presenter::PrepareCacheFrame(CommandBuffer& buffer, const ImageInfo& info,
-                                               uint64_t address, bool* substituted) {
+                                               std::span<const uint64_t> addresses,
+                                               uint64_t* hit_address, bool* substituted) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	if (substituted != nullptr) {
 		*substituted = false;
 	}
+	if (hit_address != nullptr) {
+		*hit_address = 0;
+	}
 	auto*             frame = m_impl->frames.Acquire();
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             cache = m_impl->renderer.GetTextureCache();
-	if (const auto id = cache.FindImageFromRange(address, 0x1000, /*ensure_valid=*/false); id) {
+	// m42-present (TEMPORARY, remove before commit): first candidate that resolves wins.
+	// M42FindLargestImageAt, not the plain range lookup: that one only accepts an exact size
+	// match, so a base holding more than one image (dual identity) never substituted at all.
+	ImageId  id {};
+	uint64_t address = 0;
+	for (const auto candidate: addresses) {
+		if (const auto found = cache.M42FindLargestImageAt(candidate); found) {
+			id      = found;
+			address = candidate;
+			break;
+		}
+	}
+	if (id) {
 		auto&      image  = cache.GetImage(id);
 		const auto format = image.backing.format;
 		const auto extent =

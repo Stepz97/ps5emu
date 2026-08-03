@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -86,7 +88,15 @@ void RenderContext::DeleteEopEq(LibKernel::EventQueue::KernelEqueue eq, int id) 
 	m_eop_eqs.erase(it);
 }
 
-void RenderContext::TriggerEopEvent(uint32_t context_id) {
+void RenderContext::TriggerEopEvent(uint32_t context_id, uint32_t event_type) {
+	// m41-eq-data (TEMPORARY, remove before commit): with KYTY_M41_EQ_DATA=1 the kevent
+	// data field carries the hardware EOP event type instead of the packet context id —
+	// SharpEmu parity (their TriggerRegisteredEventsByFilter passes the EVENT_TYPE), in
+	// case the guest discriminates the wakeups it consumes by that payload.
+	static const bool m41_eq_data = std::getenv("KYTY_M41_EQ_DATA") != nullptr;
+	const uint32_t    trigger_payload =
+        (m41_eq_data && event_type != 0) ? event_type : context_id;
+
 	std::vector<EopEqRegistration> registrations;
 	{
 		Common::LockGuard lock(m_eop_mutex);
@@ -97,7 +107,7 @@ void RenderContext::TriggerEopEvent(uint32_t context_id) {
 		const auto result = LibKernel::EventQueue::KernelTriggerEvent(
 		    registration.eq, static_cast<uintptr_t>(registration.id),
 		    LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,
-		    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)));
+		    reinterpret_cast<void*>(static_cast<uintptr_t>(trigger_payload)));
 		if (result == LibKernel::KERNEL_ERROR_EBADF || result == LibKernel::KERNEL_ERROR_ENOENT) {
 			DeleteEopEq(registration.eq, registration.id);
 			continue;

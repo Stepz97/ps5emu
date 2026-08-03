@@ -54,6 +54,11 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// m42-present (TEMPORARY, remove before commit): largest live image registered at this
+	// exact guest base. FindImageFromRange cannot serve the substitution probe when several
+	// images share a base (the dual-identity case) because it only accepts an exact size
+	// match against the caller's probe size.
+	[[nodiscard]] ImageId       M42FindLargestImageAt(uint64_t address);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);

@@ -1340,6 +1340,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	return result;
 }
 
+ImageId TextureCache::M42FindLargestImageAt(uint64_t address) {
+	CacheLock lock(*this, m_lock);
+	ImageId   best {};
+	uint64_t  best_size = 0;
+	for (const auto id: FindImagesInRegion(address, 0x1000, false)) {
+		const auto owner = ResolveOwner(id);
+		if (owner == nullptr || owner->info.data.address != address || owner->depth_id) {
+			continue;
+		}
+		if (owner->info.data.size > best_size) {
+			best_size = owner->info.data.size;
+			best      = id;
+		}
+	}
+	return best;
+}
+
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
 	if (!GuestRange {address, size}.Valid()) {
 		return {};

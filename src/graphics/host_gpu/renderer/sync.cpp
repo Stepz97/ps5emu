@@ -14,6 +14,7 @@
 #include "libs/errno.h"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -316,13 +317,15 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int han
 	});
 }
 
-void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, uint32_t context_id) {
+void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, uint32_t context_id,
+                                uint32_t event_type) {
 	ValidateEndOfPipeSignal({.buffer = &buffer});
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation(
-	    [&renderer, context_id] { renderer.TriggerEopEvent(context_id); });
+	scheduler.DeferPriorityOperation([&renderer, context_id, event_type] {
+		renderer.TriggerEopEvent(context_id, event_type);
+	});
 }
 
 static void EopEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {
@@ -375,8 +378,15 @@ int AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, 
 
 	int result = LibKernel::EventQueue::KernelAddEvent(eq, event);
 
+	// m41-eq-all (TEMPORARY, remove before commit): today only 0x00/0x40 reach the trigger
+	// list; any other id (compute-pipe EOP) is accepted and never fires, leaving the guest
+	// in a forever wait+timeout loop (seen live: two "Gpu::EopEqCompute" equeues, threads
+	// 18/25, timing out every ~700ms in the menu phase). With KYTY_M41_EQ_ALL=1 every id
+	// joins the trigger list — spurious triggers alongside gfx EOP, but the guest re-checks
+	// its own counters, so this discriminates "missing event" as the compose gate.
+	static const bool m41_eq_all = std::getenv("KYTY_M41_EQ_ALL") != nullptr;
 	if (result == 0 &&
-	    (id == GRAPHICS_EVENT_QUEUED_GRAPHICS_INTERRUPT || id == GRAPHICS_EVENT_EOP)) {
+	    (m41_eq_all || id == GRAPHICS_EVENT_QUEUED_GRAPHICS_INTERRUPT || id == GRAPHICS_EVENT_EOP)) {
 		renderer.AddEopEq(eq, id);
 	}
 

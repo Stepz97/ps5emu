@@ -1238,19 +1238,45 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			// m42-present probe (TEMPORARY, remove before commit):
 			// KYTY_M42_PRESENT_BASE=<hex> presents the cache image at that guest base
 			// instead of the flip surface.
-			static const uint64_t m42_present_base = []() -> uint64_t {
-				const char* v = std::getenv("KYTY_M42_PRESENT_BASE");
-				return v != nullptr ? std::strtoull(v, nullptr, 16) : 0;
+			// Comma-separated candidate list: the menu keeps rendering into these
+			// intermediate buffers every frame even after the guest stops submitting its final
+			// compose, so substituting one shows the live (untonemapped) menu instead of the
+			// black flip surface. When no candidate resolves this frame (the bloom pyramid
+			// churns these images constantly) the last good frame is re-presented rather than
+			// falling back to the black surface.
+			static const std::vector<uint64_t> m42_present_bases = []() {
+				std::vector<uint64_t> bases;
+				if (const char* v = std::getenv("KYTY_M42_PRESENT_BASE"); v != nullptr) {
+					const char* p = v;
+					while (*p != '\0') {
+						char*      end  = nullptr;
+						const auto base = std::strtoull(p, &end, 16);
+						if (end == p) {
+							break;
+						}
+						if (base != 0) {
+							bases.push_back(base);
+						}
+						p = (*end == ',') ? end + 1 : end;
+					}
+				}
+				return bases;
 			}();
-			if (m42_present_base != 0) {
-				bool substituted = false;
-				frame = &m_presenter.PrepareCacheFrame(buffer, source_info, m42_present_base,
-				                                       &substituted);
+			if (!m42_present_bases.empty()) {
+				bool     substituted = false;
+				uint64_t hit_base    = 0;
+				frame = &m_presenter.PrepareCacheFrame(buffer, source_info, m42_present_bases,
+				                                       &hit_base, &substituted);
 				static std::atomic<uint32_t> m42_present_count {0};
+				static std::atomic<uint32_t> m42_present_hits {0};
 				const auto n = m42_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (substituted) {
+					m42_present_hits.fetch_add(1, std::memory_order_relaxed);
+				}
 				if (n <= 8 || (n & 0x3fu) == 0) {
-					LOGF("m42-present: base=0x%010" PRIx64 " substituted=%d (n=%u)\n",
-					     m42_present_base, substituted ? 1 : 0, n);
+					LOGF("m42-present: base=0x%010" PRIx64 " substituted=%d hits=%u (n=%u)\n",
+					     hit_base, substituted ? 1 : 0,
+					     m42_present_hits.load(std::memory_order_relaxed), n);
 				}
 			} else {
 				frame = &m_presenter.PrepareFrame(buffer, source_info);

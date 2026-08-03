@@ -396,6 +396,26 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		// m41-wait-probe v2 (TEMPORARY, remove before commit): per-address census of failed
+		// waits with the frame number, to discriminate a GPU-side compose gate (persistent
+		// failed waits during the menu phase) from a CPU-side one (none). First 4 failures
+		// per address, then one out of every 4096, so late phases stay visible per address.
+		static const bool m41_probe = std::getenv("KYTY_M41_WAIT_PROBE") != nullptr;
+		if (m41_probe) {
+			thread_local std::unordered_map<uint64_t, uint64_t> m41_seen;
+			auto& count = m41_seen[reinterpret_cast<uint64_t>(addr)];
+			count++;
+			if (count <= 4 || (count & 0xfffu) == 0) {
+				std::fprintf(stderr,
+				             "m41-wait: frame=%d addr=0x%010" PRIx64 " have=0x%" PRIx64
+				             " want=0x%" PRIx64 " mask=0x%" PRIx64 " func=%" PRIu32
+				             " n=%" PRIu64 "\n",
+				             m_renderer.GetGpu().GetFrameNum(),
+				             reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(*addr),
+				             static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func,
+				             count);
+			}
+		}
 		SuspendPm4();
 	}
 }
@@ -1178,6 +1198,91 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	// m42-srt-root probe (TEMPORARY, remove before commit): for the four menu-phase shaders
+	// whose SRT root is permanently null (wall 42, boot J), dump the raw user SGPRs of each
+	// dispatch and chase the first pointer hop. Discriminates "the guest really enqueues a
+	// zero root every frame" (SGPR pair reads 0 -> packet placeholder never patched, a
+	// CPU<->CP race) from "root points at a live table whose +0x18 slot is null" (structure
+	// half-filled). KYTY_M42_SRT_ROOT=<hex,hex,...> selects the watched shader addresses.
+	static const std::vector<uint64_t> srt_root_watch = []() {
+		std::vector<uint64_t> hashes;
+		if (const char* v = std::getenv("KYTY_M42_SRT_ROOT"); v != nullptr) {
+			const char* p = v;
+			while (*p != '\0') {
+				char*      end  = nullptr;
+				const auto hash = std::strtoull(p, &end, 16);
+				if (end == p) {
+					break;
+				}
+				if (hash != 0) {
+					hashes.push_back(hash);
+				}
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return hashes;
+	}();
+	if (!srt_root_watch.empty()) {
+		const auto& cs_probe = m_sh_ctx.GetCs();
+		const auto  cs_addr  = static_cast<uint64_t>(cs_probe.cs_regs.data_addr);
+		if (std::find(srt_root_watch.begin(), srt_root_watch.end(), cs_addr) !=
+		    srt_root_watch.end()) {
+			static thread_local std::unordered_map<uint64_t, uint32_t> root_seen;
+			auto& count = root_seen[cs_addr];
+			count++;
+			// Transition detection: sample the ring slot every dispatch and report only when
+			// its content changes. Answers "does the guest CPU ever refill these tables after
+			// the fade?" without drowning the log — a permanently silent ring means the
+			// refiller thread is parked, a changing one means a read/write race.
+			bool content_changed = false;
+			{
+				const uint32_t root_sgprs = m_sh_ctx.GetCs().cs_regs.user_sgpr;
+				const uint64_t probe_root =
+				    root_sgprs >= 2
+				        ? (static_cast<uint64_t>(m_sh_ctx.GetCs().cs_user_sgpr.value[0]) |
+				           (static_cast<uint64_t>(m_sh_ctx.GetCs().cs_user_sgpr.value[1]) << 32u))
+				        : 0;
+				uint64_t probe_words[4] = {0, 0, 0, 0};
+				if (probe_root != 0) {
+					(void)LibKernel::Memory::TryReadBacking(probe_root, probe_words,
+					                                        sizeof(probe_words));
+				}
+				static thread_local std::unordered_map<uint64_t, uint64_t> slot_state;
+				const uint64_t digest = probe_root ^ probe_words[0] ^ (probe_words[1] << 1u) ^
+				                        (probe_words[2] << 2u) ^ (probe_words[3] << 3u);
+				auto& previous = slot_state[cs_addr];
+				if (previous != digest) {
+					previous        = digest;
+					content_changed = true;
+				}
+			}
+			if (content_changed || count <= 8 || (count & 0xffu) == 0) {
+				const uint32_t sgpr_count = cs_probe.cs_regs.user_sgpr;
+				char           sgprs[16 * 12 + 1];
+				int            off = 0;
+				for (uint32_t i = 0; i < sgpr_count && i < 16; i++) {
+					off += std::snprintf(sgprs + off, sizeof(sgprs) - static_cast<size_t>(off),
+					                     " %08x", cs_probe.cs_user_sgpr.value[i]);
+				}
+				const uint64_t root =
+				    sgpr_count >= 2 ? (static_cast<uint64_t>(cs_probe.cs_user_sgpr.value[0]) |
+				                       (static_cast<uint64_t>(cs_probe.cs_user_sgpr.value[1])
+				                        << 32u))
+				                    : 0;
+				uint64_t hop[4]     = {0, 0, 0, 0};
+				bool     hop_ok     = false;
+				if (root != 0) {
+					hop_ok = LibKernel::Memory::TryReadBacking(root, hop, sizeof(hop));
+				}
+				LOGF("m42-srt-root: frame=%d cs=0x%010" PRIx64 " n=%u sgprs=%u [%s ] root=0x%010" PRIx64
+				     " hop_ok=%d hop=[%016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64
+				     "]\n",
+				     m_renderer.GetGpu().GetFrameNum(), cs_addr, count, sgpr_count, sgprs, root,
+				     hop_ok ? 1 : 0, hop[0], hop[1], hop[2], hop[3]);
+			}
+		}
+	}
+
 	// m42-queue-wait probe (TEMPORARY, remove before commit): a compute dispatch whose SRT
 	// table is readable-but-all-zero lost the fill race against the guest CPU (the guest
 	// fills right after consuming an EOP written later by this same processor or a sibling
@@ -1412,7 +1517,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	switch (interrupt_selector) {
 		case 0x00:
 		case 0x03: with_interrupt = false; break;
-		case 0x01: Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id); return;
+		case 0x01:
+			Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id,
+			                                 eop_event_type);
+			return;
 		case 0x02: with_interrupt = true; break;
 		default: EXIT("unknown interrupt_selector\n");
 	}
@@ -1621,10 +1729,11 @@ void CommandProcessor::EmitGlobalBarrier() {
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
 }
 
-void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
+void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id,
+                                                  uint32_t eop_event_type) {
 	CheckBuffer();
 
-	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id);
+	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id, eop_event_type);
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {

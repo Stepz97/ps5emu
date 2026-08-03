@@ -18,7 +18,8 @@ namespace Sync {
 [[nodiscard]] uint64_t ReadReferenceClock();
 
 void TriggerAgcUserInterrupt();
-void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, uint32_t context_id);
+void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, uint32_t context_id,
+                                uint32_t event_type = 0);
 
 void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
                         uint32_t value);

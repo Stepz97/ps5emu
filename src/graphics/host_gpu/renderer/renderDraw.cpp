@@ -976,6 +976,43 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	EXIT_IF(draw.name == nullptr);
 	auto& ctx = buffer.GetRegisters();
 
+	// m42-rawrt (TEMPORARY, remove before commit): pre-drop census of draws whose RAW
+	// color-target register points at a watched base (KYTY_M42_RAWRT=<hex,...>), BEFORE any
+	// resolve/skip path can drop them. Discriminates "guest stops submitting the menu
+	// compose" from "kyty silently drops it" — and logs the target mask, the prime
+	// silent-drop suspect.
+	static const std::vector<uint64_t> m42_rawrt_bases = []() {
+		std::vector<uint64_t> bases;
+		if (const char* v = std::getenv("KYTY_M42_RAWRT"); v != nullptr) {
+			const char* p = v;
+			while (*p != '\0') {
+				char*      end  = nullptr;
+				const auto base = std::strtoull(p, &end, 16);
+				if (end == p) {
+					break;
+				}
+				if (base != 0) {
+					bases.push_back(base);
+				}
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return bases;
+	}();
+	if (!m42_rawrt_bases.empty()) {
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			const auto raw = static_cast<uint64_t>(ctx.GetRenderTarget(slot).base.addr);
+			if (raw != 0 && std::find(m42_rawrt_bases.begin(), m42_rawrt_bases.end(), raw) !=
+			                    m42_rawrt_bases.end()) {
+				LOGF("m42-rawrt: frame=%u draw=%s slot=%u raw=0x%010" PRIx64
+				     " mask_slot=%d mask=0x%08" PRIx32 "\n",
+				     static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()), draw.name, slot,
+				     raw, render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 ? 1 : 0,
+				     ctx.GetRenderTargetMask());
+			}
+		}
+	}
+
 	if (ResolveColorTargets(submit_id, buffer, render_target_slice_offset)) {
 		return false;
 	}

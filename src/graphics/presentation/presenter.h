@@ -4,6 +4,7 @@
 #include "common/common.h"
 
 #include <memory>
+#include <span>
 
 namespace Libs::Graphics {
 
@@ -30,8 +31,11 @@ public:
 	// guest base address instead of the flip surface (G-buffer content is invisible to the
 	// CPU readback, GPU->GPU copy is the only honest viewer). Falls back to the normal
 	// surface when the address does not resolve or its format cannot feed the frame.
+	// Takes a candidate list and acquires exactly ONE frame: acquiring per candidate would
+	// drain the frame pool and deadlock the presenter.
 	[[nodiscard]] Frame& PrepareCacheFrame(CommandBuffer& command, const ImageInfo& info,
-	                                       uint64_t address, bool* substituted);
+	                                       std::span<const uint64_t> addresses,
+	                                       uint64_t* hit_address, bool* substituted);
 	[[nodiscard]] Frame*         PrepareLastFrame();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;

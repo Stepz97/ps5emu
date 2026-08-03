@@ -2641,7 +2641,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x03: break;
 			case 0x01:
 			case 0x02:
-			case 0x04: cp.TriggerEopEventAtEndOfPipe(interrupt_context_id); break;
+			case 0x04: cp.TriggerEopEventAtEndOfPipe(interrupt_context_id, eop_event_type); break;
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
 	};

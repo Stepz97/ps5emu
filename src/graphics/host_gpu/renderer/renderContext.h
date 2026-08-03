@@ -50,7 +50,7 @@ public:
 
 	void AddEopEq(LibKernel::EventQueue::KernelEqueue eq, int id);
 	void DeleteEopEq(LibKernel::EventQueue::KernelEqueue eq, int id);
-	void TriggerEopEvent(uint32_t context_id);
+	void TriggerEopEvent(uint32_t context_id, uint32_t event_type = 0);
 
 private:
 	struct EopEqRegistration {

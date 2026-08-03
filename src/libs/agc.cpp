@@ -4022,6 +4022,12 @@ int KYTY_SYSV_ABI GraphicsDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue e
 		return LibKernel::KERNEL_ERROR_EBADF;
 	}
 
+	// m41-eq-probe (TEMPORARY, remove before commit): which event ids does the guest
+	// actually subscribe? Only 0x00/0x40 are wired to the trigger list today — any other
+	// id is accepted and never fires (silent forever-wait).
+	LOGF("m41-eq: AddEqEvent eq=%lld id=0x%02x udata=%p\n", static_cast<long long>(eq), id,
+	     udata);
+
 	EXIT_IF(g_renderer == nullptr);
 	return Sync::AddEqEvent(*g_renderer, eq, id, udata);
 }
