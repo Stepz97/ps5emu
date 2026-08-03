@@ -873,7 +873,16 @@ void CreatePipelineInternal(
 	depth_stencil_info.sType            = vk::StructureType::ePipelineDepthStencilStateCreateInfo;
 	depth_stencil_info.pNext            = nullptr;
 	depth_stencil_info.flags            = {};
+	// m42-nodepth (TEMPORARY, remove before commit): the menu pass renders with the depth
+	// test on against a depth buffer the guest never clears in that phase, so stale near
+	// values would reject fragments and leave a rectangular hole — the shape actually
+	// observed. KYTY_M42_NO_DEPTH_TEST=1 forces the comparison to always pass, which either
+	// fills the missing quadrant (cause confirmed) or leaves it untouched (cause ruled out).
+	static const bool m42_no_depth = std::getenv("KYTY_M42_NO_DEPTH_TEST") != nullptr;
 	depth_stencil_info.depthTestEnable  = (static_params.depth_test_enable ? VK_TRUE : VK_FALSE);
+	if (m42_no_depth) {
+		depth_stencil_info.depthTestEnable = VK_FALSE;
+	}
 	depth_stencil_info.depthWriteEnable = (static_params.depth_write_enable ? VK_TRUE : VK_FALSE);
 	depth_stencil_info.depthCompareOp   = static_params.depth_compare_op;
 	depth_stencil_info.depthBoundsTestEnable =
