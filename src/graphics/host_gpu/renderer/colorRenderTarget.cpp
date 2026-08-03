@@ -228,8 +228,15 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
 
+	// The 128-line budget is spent entirely during loading, so a menu-phase census sees no
+	// colour-target samples at all and any per-draw attribution built on this log is empty.
+	// KYTY_M42_RT_LOG_MAX raises the budget for those censuses; unset keeps the old limit.
+	static const uint32_t rt_log_max = []() -> uint32_t {
+		const char* v = std::getenv("KYTY_M42_RT_LOG_MAX");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 128u;
+	}();
 	auto decision_log_id = g_render_color_log_count.fetch_add(1);
-	if (decision_log_id < 128) {
+	if (decision_log_id < rt_log_max) {
 		LOGF("RenderColorTarget: slot=%" PRIu32 " addr=0x%010" PRIx64 " size=0x%016" PRIx64
 		     " extent=%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
 		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32 " samples=%u tile=%s\n",
