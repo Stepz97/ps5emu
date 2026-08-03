@@ -212,7 +212,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    " clear=%s clear_rgba=(%.3f,%.3f,%.3f,%.3f) cc_mode=%u cc_op=0x%02x"
 	    " blend=%s src=%u dst=%u comb=%u ps_tex=%d sampled=%d storage=%d ps_kill=%s target_mode0=%u"
 	    " depth_test=%s depth_write=%s depth_func=%u depth_clear=%s viewport=(%.1f,%.1f %.1fx%.1f) "
-	    "scissor=(%d,%d)-(%d,%d)\n",
+	    "scissor=(%d,%d)-(%d,%d) depth_addr=0x%010" PRIx64 " depth_extent=%ux%u\n",
 	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name,
 	    RenderColorTypeName(color.type), color.base_addr, extent.width, extent.height,
 	    ucfg.GetPrimType(), index_count, flags, ctx.GetRenderTargetMask(),
@@ -226,7 +226,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    dc.z_enable ? "true" : "false", dc.z_write_enable ? "true" : "false", dc.zfunc,
 	    depth.depth_clear_enable ? "true" : "false", vp0.xoffset - vp0.xscale,
 	    vp0.yoffset - vp0.yscale, vp0.xscale * 2.0f, vp0.yscale * 2.0f, sc.left, sc.top, sc.right,
-	    sc.bottom);
+	    sc.bottom, depth.depth_buffer_vaddr, depth.width, depth.height);
 
 	LogMrtState(draw_name, buffer, ps_input_info);
 }
