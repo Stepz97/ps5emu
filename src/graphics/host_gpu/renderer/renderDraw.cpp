@@ -180,8 +180,14 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 		return;
 	}
 
+	// The 192-line budget is spent during loading, so a menu-phase census of viewport and
+	// scissor sees nothing. KYTY_M42_DRAW_STATE_MAX raises it; unset keeps the old limit.
+	static const uint32_t draw_state_max = []() -> uint32_t {
+		const char* v = std::getenv("KYTY_M42_DRAW_STATE_MAX");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 192u;
+	}();
 	auto log_id = g_draw_state_log_count.fetch_add(1);
-	if (log_id >= 192) {
+	if (log_id >= draw_state_max) {
 		return;
 	}
 
