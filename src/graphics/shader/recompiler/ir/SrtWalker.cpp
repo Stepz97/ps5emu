@@ -565,6 +565,25 @@ private:
 		if (m_runtime.read_memory == nullptr) {
 			std::memcpy(&result, reinterpret_cast<const void*>(address), sizeof(result));
 		}
+		// m42-nullptr (TEMPORARY, remove before commit): a read that SUCCEEDS and yields zero is
+		// how the null base gets built -- the halves of the broken pointer are two such reads. The
+		// failing dereference only reports 0x18/0x58/0x5c, which says nothing about WHERE the null
+		// pointer is stored. Logging the address of every zero-valued read names that location, so
+		// emptiness can be measured at the nested pointer instead of at the root table, which is
+		// the region M42WaitForSrtTable currently checks.
+		if (result == 0) {
+			if (const char* null_probe = std::getenv("KYTY_M42_NULLPTR");
+			    null_probe != nullptr && *null_probe == '1') {
+				static std::atomic<uint32_t> null_count {0};
+				const auto                   n = null_count.fetch_add(1);
+				if (n < 512 || (n & 0xffffu) == 0) {
+					fprintf(stderr,
+					        "m42-nullptr: hash=0x%016" PRIx64 " pc=0x%08x read 0 at 0x%016" PRIx64
+					        " (base=0x%016" PRIx64 " imm=0x%x)\n",
+					        m_program.shader_hash, value.pc, address, base, value.imm);
+				}
+			}
+		}
 		return true;
 	}
 
