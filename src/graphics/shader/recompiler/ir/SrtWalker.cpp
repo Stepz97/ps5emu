@@ -534,6 +534,31 @@ private:
 			// callback declined to service it, which is exactly the "pointer is null in this
 			// dispatch's snapshot" case flat SRT reads are allowed to degrade on.
 			m_soft_failure = true;
+			// m42-prov (TEMPORARY, remove before commit): the failing addresses on Astro Bot's
+			// menu are 0x18/0x58/0x5c, i.e. offsets from a base that evaluated CLEANLY to zero.
+			// Knowing the base is null is not enough: it matters whether the guest genuinely
+			// stores zero in that pointer, or whether the walker sourced the pointer from the
+			// wrong place. Naming where lo/hi came from is what separates those two.
+			if (const char* prov_probe = std::getenv("KYTY_M42_PROV");
+			    prov_probe != nullptr && *prov_probe == '1') {
+				static std::atomic<uint32_t> prov_count {0};
+				const auto                   n = prov_count.fetch_add(1);
+				if (n < 128 || (n & 0xfffu) == 0) {
+					const auto describe = [this](uint32_t id) {
+						if (id >= m_program.provenance.values.size()) {
+							return std::string("<out-of-range>");
+						}
+						const auto& v = m_program.provenance.values[id];
+						return fmt::format("id={} op={} pc=0x{:08x} imm=0x{:x}", id,
+						                   static_cast<uint32_t>(v.op), v.pc, v.imm);
+					};
+					fprintf(stderr,
+					        "m42-prov: hash=0x%016" PRIx64 " addr=0x%016" PRIx64
+					        " base=0x%016" PRIx64 " imm=0x%x lo[%s] hi[%s]\n",
+					        m_program.shader_hash, address, base, value.imm,
+					        describe(value.args[0]).c_str(), describe(value.args[1]).c_str());
+				}
+			}
 			return Fail(
 			    error, fmt::format("ReadConst pc=0x{:08x} failed at 0x{:016x}", value.pc, address));
 		}
