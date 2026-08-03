@@ -773,6 +773,47 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.width == std::numeric_limits<uint32_t>::max() ||
 	        state.height == std::numeric_limits<uint32_t>::max());
+
+	// m42-renderarea probe (TEMPORARY, remove before commit): the std::min chain above clamps
+	// renderArea to the SMALLEST attachment, while loadOp=eClear only clears inside renderArea.
+	// A pass mixing a large colour target with a smaller attachment therefore clears just the
+	// top-left corner of the large one and leaves the rest intact — the exact signature of wall
+	// 42's black quadrant (960x540 cleared out of 1920x1080). Fires only on a mismatch, so it is
+	// self-limiting; the cap is a backstop against a per-draw flood.
+	if (const char* renderarea_probe = std::getenv("KYTY_M42_RENDERAREA");
+	    renderarea_probe != nullptr && *renderarea_probe == '1') {
+		uint32_t max_w = 0;
+		uint32_t max_h = 0;
+		for (uint32_t i = 0; i < color_count; i++) {
+			max_w = std::max(max_w, colors[i].extent.width);
+			max_h = std::max(max_h, colors[i].extent.height);
+		}
+		if (depth.image_id) {
+			max_w = std::max(max_w, depth.width);
+			max_h = std::max(max_h, depth.height);
+		}
+		if (state.width < max_w || state.height < max_h) {
+			static std::atomic<uint32_t> mismatch_count = 0;
+			const auto                   id             = mismatch_count.fetch_add(1);
+			if (id < 256) {
+				LOGF("m42-renderarea[%u]: frame=%u MISMATCH renderArea=%ux%u largest=%ux%u\n", id,
+				     static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()), state.width,
+				     state.height, max_w, max_h);
+				for (uint32_t i = 0; i < color_count; i++) {
+					LOGF("m42-renderarea[%u]:   color[%u] addr=0x%010" PRIx64
+					     " extent=%ux%u clear=%s\n",
+					     id, i, colors[i].base_addr, colors[i].extent.width,
+					     colors[i].extent.height,
+					     colors[i].color_clear_enable ? "true" : "false");
+				}
+				if (depth.image_id) {
+					LOGF("m42-renderarea[%u]:   depth addr=0x%010" PRIx64 " extent=%ux%u clear=%s\n",
+					     id, depth.depth_buffer_vaddr, depth.width, depth.height,
+					     depth.depth_clear_enable ? "true" : "false");
+				}
+			}
+		}
+	}
 	return state;
 }
 
@@ -1114,6 +1155,108 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 				     " image=%u.%u extent=%ux%u\n",
 				     layout_frame, info.target_slot, raw, info.base_addr, info.image_id.index,
 				     info.image_id.generation, info.extent.width, info.extent.height);
+			}
+		}
+	}
+
+	// KYTY_M42_DROP_SMALL_DEPTH: Vulkan requires renderArea to fit inside EVERY attachment, so
+	// AcquireRenderTargets clamps it to the smallest one. GCN/RDNA has no such rule — colour
+	// writes are bounded by the viewport and scissor, and a depth buffer smaller than the colour
+	// target is legal as long as depth is not sampled. Astro Bot's menu pass binds a 960x540
+	// depth buffer alongside the 1920x1080 menu target, so the clamp shrinks renderArea to a
+	// quarter and clips the pass to the top-left corner — wall 42's black quadrant. When depth
+	// cannot affect the result (no test, no write, no bounds test, no stencil, no clear), the
+	// attachment carries no information and dropping it restores the full renderArea. Clearing
+	// image_id here covers BOTH consumers of state.depth_info: AcquireRenderTargets stops
+	// shrinking renderArea, and the pipeline key stops declaring a depth format, so the two
+	// stay consistent.
+	if (const char* drop = std::getenv("KYTY_M42_DROP_SMALL_DEPTH");
+	    drop != nullptr && *drop == '1' && state.depth_info.image_id && state.color_count > 0) {
+		uint32_t max_w = 0;
+		uint32_t max_h = 0;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			max_w = std::max(max_w, state.color_info[i].extent.width);
+			max_h = std::max(max_h, state.color_info[i].extent.height);
+		}
+		const bool undersized =
+		    state.depth_info.width < max_w || state.depth_info.height < max_h;
+		// A stencil test that is enabled but compares eAlways and keeps every op cannot reject a
+		// fragment, so the attachment carries no information even though the enable bit is set.
+		// stencil_face_accesses_attachment() is the fork's own predicate for exactly that.
+		const bool stencil_inert =
+		    !state.depth_info.stencil_test_enable ||
+		    (!stencil_face_accesses_attachment(state.depth_info.stencil_static_front,
+		                                       state.depth_info.stencil_dynamic_front) &&
+		     !stencil_face_accesses_attachment(state.depth_info.stencil_static_back,
+		                                       state.depth_info.stencil_dynamic_back));
+		const bool inert = !state.depth_info.depth_test_enable &&
+		                   !state.depth_info.depth_write_enable &&
+		                   !state.depth_info.depth_bounds_test_enable && stencil_inert &&
+		                   !state.depth_info.depth_clear_enable &&
+		                   !state.depth_info.depth_load_clear_enable &&
+		                   !state.depth_info.stencil_clear_enable &&
+		                   !state.depth_info.AttachmentWriteAspects() &&
+		                   // depth_meta_clear_enable is only resolved later, inside
+		                   // AcquireRenderTargets, so it cannot be trusted here. Refusing to drop
+		                   // any HTile-backed depth keeps a pending fast-clear from being skipped.
+		                   !state.depth_info.htile;
+		if (undersized) {
+			static std::atomic<uint32_t> under_count {0};
+			const auto                   n = under_count.fetch_add(1);
+			if (n < 24 || (n & 0x3ffu) == 0) {
+				// Viewport and scissor say what coverage the GUEST asked for. If they span the
+				// full colour target, kyty's renderArea clamp is what shrinks the pass and the
+				// clamp is the bug; if they only span the small extent, the clamp is harmless
+				// and the black quadrant comes from somewhere else entirely.
+				const auto& probe_vp  = ctx.GetScreenViewport();
+				const auto& probe_vp0 = probe_vp.viewports[0];
+				const auto  probe_sc  = calc_final_scissor(probe_vp, ctx.GetScanModeControl(),
+				                                           state.color_info[0].extent);
+				const auto& sf = state.depth_info.stencil_static_front;
+				const auto& df = state.depth_info.stencil_dynamic_front;
+				const auto& sb = state.depth_info.stencil_static_back;
+				const auto& db = state.depth_info.stencil_dynamic_back;
+				LOGF("m42-drop-depth: frame=%u stencil front(cmp=%u fail=%u pass=%u zfail=%u"
+				     " cmask=0x%x wmask=0x%x ref=%u accesses=%s)"
+				     " back(cmp=%u fail=%u pass=%u zfail=%u cmask=0x%x wmask=0x%x ref=%u"
+				     " accesses=%s)\n",
+				     static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()),
+				     static_cast<uint32_t>(sf.compareOp), static_cast<uint32_t>(sf.failOp),
+				     static_cast<uint32_t>(sf.passOp), static_cast<uint32_t>(sf.depthFailOp),
+				     df.compareMask, df.writeMask, df.reference,
+				     stencil_face_accesses_attachment(sf, df) ? "true" : "false",
+				     static_cast<uint32_t>(sb.compareOp), static_cast<uint32_t>(sb.failOp),
+				     static_cast<uint32_t>(sb.passOp), static_cast<uint32_t>(sb.depthFailOp),
+				     db.compareMask, db.writeMask, db.reference,
+				     stencil_face_accesses_attachment(sb, db) ? "true" : "false");
+				LOGF("m42-drop-depth: frame=%u viewport=(%.1f,%.1f %.1fx%.1f)"
+				     " scissor=(%d,%d)-(%d,%d)\n",
+				     static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()),
+				     probe_vp0.xoffset - probe_vp0.xscale, probe_vp0.yoffset - probe_vp0.yscale,
+				     probe_vp0.xscale * 2.0f, probe_vp0.yscale * 2.0f, probe_sc.left, probe_sc.top,
+				     probe_sc.right, probe_sc.bottom);
+				LOGF("m42-drop-depth: frame=%u depth 0x%010" PRIx64 " %ux%u < colour %ux%u"
+				     " inert=%s ztest=%s zwrite=%s zbounds=%s stest=%s zclear=%s zloadclear=%s"
+				     " sclear=%s zmetaclear=%s htile=%s writeaspects=0x%x action=%s n=%u\n",
+				     static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()),
+				     state.depth_info.depth_buffer_vaddr, state.depth_info.width,
+				     state.depth_info.height, max_w, max_h, inert ? "true" : "false",
+				     state.depth_info.depth_test_enable ? "true" : "false",
+				     state.depth_info.depth_write_enable ? "true" : "false",
+				     state.depth_info.depth_bounds_test_enable ? "true" : "false",
+				     state.depth_info.stencil_test_enable ? "true" : "false",
+				     state.depth_info.depth_clear_enable ? "true" : "false",
+				     state.depth_info.depth_load_clear_enable ? "true" : "false",
+				     state.depth_info.stencil_clear_enable ? "true" : "false",
+				     state.depth_info.depth_meta_clear_enable ? "true" : "false",
+				     state.depth_info.htile ? "true" : "false",
+				     static_cast<uint32_t>(
+				         static_cast<VkImageAspectFlags>(state.depth_info.AttachmentWriteAspects())),
+				     inert ? "dropped" : "kept", n);
+			}
+			if (inert) {
+				state.depth_info.image_id = {};
+				state.depth_info.format   = vk::Format::eUndefined;
 			}
 		}
 	}

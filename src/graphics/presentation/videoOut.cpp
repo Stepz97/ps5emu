@@ -1238,7 +1238,19 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
                             return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10))
                                                                        : 64u;
 						}();
-						if ((dump_tick.fetch_add(1, std::memory_order_relaxed) % dump_every) == 0) {
+						// KYTY_M42_DUMP_AT_TICK pins the dump to one exact flip instead of
+						// "every Nth, last one wins". Without pinning, two boots dump at
+						// whatever moment they happened to be killed at, so their contents
+						// differ for reasons unrelated to the change under test — a negative
+						// control showed +0.66 points of drift with no code change at all,
+						// which is enough to fake a passing result.
+						static const uint32_t dump_at_tick = []() -> uint32_t {
+                            const char* v = std::getenv("KYTY_M42_DUMP_AT_TICK");
+                            return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10))
+                                                                       : 0u;
+						}();
+						const auto tick = dump_tick.fetch_add(1, std::memory_order_relaxed);
+						if (dump_at_tick != 0 ? (tick == dump_at_tick) : ((tick % dump_every) == 0)) {
 							auto& dump_cache = m_presenter.Renderer().GetTextureCache();
 							if (const auto id = dump_cache.M42FindLargestImageAt(dump_base); id) {
 								auto&              img = dump_cache.GetImage(id);
