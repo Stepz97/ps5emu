@@ -781,6 +781,22 @@ static bool EvaluateRuntimeSourcesImpl(const Program&                           
 					}
 					return false;
 				}
+				// m42-slots (TEMPORARY, remove before commit): the summary below only reports
+				// the FIRST failure, so "3 flat slot(s) unreadable" has never said WHICH three.
+				// A soft failure silently substitutes zero and the shader runs on with it, so
+				// naming the slots is the difference between "the walk degraded" and knowing
+				// which resource the lighting compute lost.
+				if (const char* slots_probe = std::getenv("KYTY_M42_SLOTS");
+				    slots_probe != nullptr && *slots_probe == '1') {
+					static std::atomic<uint32_t> slot_log_count {0};
+					const auto                   n = slot_log_count.fetch_add(1);
+					if (n < 256 || (n & 0xfffu) == 0) {
+						fprintf(stderr,
+						        "m42-slots: hash=0x%016" PRIx64 " slot=%u use_pc=0x%08x (%s)\n",
+						        program.shader_hash, read.flat_offset, read.use_pc,
+						        slot_error.c_str());
+					}
+				}
 				flattened[read.flat_offset] = 0;
 				if (failed_slots == 0) {
 					first_failure = std::move(slot_error);
