@@ -1710,7 +1710,21 @@ static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
 	// if (!Config::GraphicsDebugDumpEnabled()) {
 	//	return;
 	// }
-	return;
+	// m42-disasm (TEMPORARY, remove before commit): the dump is disabled by the return below.
+	// KYTY_M42_DISASM=<hex hash> re-enables it for ONE shader, to read the decoded instructions
+	// around a specific PC. The open question it serves: the SRT walk collects REACHABLE
+	// ReadConst values, so a read that fails may sit on a branch the shader would not take when
+	// the pointer is null -- in which case the degradation is harmless and the black output has
+	// another cause entirely. Only the disassembly around the read can tell.
+	{
+		static const uint64_t disasm_hash = []() -> uint64_t {
+			const char* v = std::getenv("KYTY_M42_DISASM");
+			return v != nullptr ? std::strtoull(v, nullptr, 16) : 0;
+		}();
+		if (disasm_hash == 0 || shader_hash != disasm_hash) {
+			return;
+		}
+	}
 	EXIT_IF(code.empty());
 
 	static std::atomic_int id = 0;
