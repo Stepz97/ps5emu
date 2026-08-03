@@ -219,6 +219,61 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
 
+	// m42-writers (TEMPORARY, remove before commit): census of the dispatches that WRITE a
+	// watched guest base (KYTY_M42_WRITERS=<hex,hex,...>), with the shader hash, the thread
+	// group counts and the descriptor extents. Counting how many distinct dispatches cover a
+	// buffer in the loading phase versus the menu phase says whether a producer stops being
+	// emitted — the open question behind the quarter of the lighting output nobody writes.
+	static const std::vector<uint64_t> m42_writer_bases = []() {
+		std::vector<uint64_t> bases;
+		if (const char* v = std::getenv("KYTY_M42_WRITERS"); v != nullptr) {
+			const char* p = v;
+			while (*p != '\0') {
+				char*      end  = nullptr;
+				const auto base = std::strtoull(p, &end, 16);
+				if (end == p) {
+					break;
+				}
+				if (base != 0) {
+					bases.push_back(base);
+				}
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return bases;
+	}();
+	if (!m42_writer_bases.empty() && resources.images.size() == program.info.images.size()) {
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (!program.info.images[i].written) {
+				continue;
+			}
+			const auto w = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+			const auto wb = w.Base40();
+			if (std::find(m42_writer_bases.begin(), m42_writer_bases.end(), wb) ==
+			    m42_writer_bases.end()) {
+				continue;
+			}
+			static Common::Mutex                            writer_mutex;
+			static std::unordered_map<uint64_t, uint32_t>   writer_seen;
+			const uint64_t key = cs_regs.cs_regs.data_addr ^ (wb << 1u) ^
+			                     (static_cast<uint64_t>(i) << 48u);
+			uint32_t seen_count = 0;
+			{
+				Common::LockGuard writer_lock(writer_mutex);
+				seen_count = ++writer_seen[key];
+			}
+			if (seen_count <= 4 || (seen_count & 0xffu) == 0) {
+				LOGF("m42-writers: frame=%u shader=0x%016" PRIx64 " img[%u] base=0x%010" PRIx64
+				     " %ux%u fmt=%u groups=%ux%ux%u threads=%ux%ux%u n=%u\n",
+				     frame_num, cs_regs.cs_regs.data_addr, i, wb,
+				     static_cast<uint32_t>(w.Width5()) + 1u,
+				     static_cast<uint32_t>(w.Height5()) + 1u, w.Format(), thread_group_x,
+				     thread_group_y, thread_group_z, input_info.threads_num[0],
+				     input_info.threads_num[1], input_info.threads_num[2], seen_count);
+			}
+		}
+	}
+
 	// scanout-probe: log the FIRST sighting of every guest address a compute shader can
 	// write (buffers and storage images), to attribute which dispatch (if any) produces
 	// the buffer the scan-out presents. Runs BEFORE the clear fast-paths so clear targets
