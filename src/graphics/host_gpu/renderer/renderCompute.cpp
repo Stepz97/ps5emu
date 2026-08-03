@@ -242,6 +242,41 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 		}
 		return bases;
 	}();
+	// Buffer side of the same census: a dispatch whose thread count comes from a counter the
+	// GPU produced shows up here as a small written buffer. Logs the first dwords so a value
+	// in the same range as the dispatch thread count is recognisable on sight.
+	if (!m42_writer_bases.empty() && resources.buffers.size() == program.info.buffers.size()) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			if (!program.info.buffers[i].written) {
+				continue;
+			}
+			const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			const uint64_t bb   = r.Base48();
+			const uint64_t size = static_cast<uint64_t>(r.Stride()) * r.NumRecords();
+			if (bb == 0 || size == 0 || size > 4096) {
+				continue; // counters and small work-lists only
+			}
+			uint32_t words[4] = {0, 0, 0, 0};
+			if (!LibKernel::Memory::TryReadBacking(bb, words, sizeof(words))) {
+				continue;
+			}
+			const bool interesting = words[0] > 100000 && words[0] < 4000000;
+			static Common::Mutex                          cnt_mutex;
+			static std::unordered_map<uint64_t, uint32_t> cnt_seen;
+			uint32_t seen = 0;
+			{
+				Common::LockGuard cnt_lock(cnt_mutex);
+				seen = ++cnt_seen[bb ^ (cs_regs.cs_regs.data_addr << 1u)];
+			}
+			if (interesting && (seen <= 6 || (seen & 0x3ffu) == 0)) {
+				LOGF("m42-counter: frame=%u shader=0x%016" PRIx64 " buf[%u] addr=0x%012" PRIx64
+				     " size=%" PRIu64 " words=[%u %u %u %u] n=%u\n",
+				     frame_num, cs_regs.cs_regs.data_addr, i, bb, size, words[0], words[1],
+				     words[2], words[3], seen);
+			}
+		}
+	}
+
 	if (!m42_writer_bases.empty() && resources.images.size() == program.info.images.size()) {
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			if (!program.info.images[i].written) {
