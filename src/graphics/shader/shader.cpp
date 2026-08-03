@@ -1161,6 +1161,23 @@ static bool M42WaitForSrtTable(const HW::ComputeShaderInfo& regs, uint64_t shade
 	if (base == 0) {
 		return false;
 	}
+	// m42-root (TEMPORARY, remove before commit): table_empty below judges emptiness from the
+	// first 32 dwords at THIS base, i.e. a 128-byte window at the root. The pointer that actually
+	// breaks the lighting walks was measured living at 0x50cc3cd00, and if that address falls
+	// outside this window the check cannot see it -- which would explain the ~1/3 of degraded
+	// walks that report a "filled" table. Logging the root base next to the shader hash is what
+	// tests that, so print it and let the arithmetic decide rather than assuming.
+	if (const char* root_probe = std::getenv("KYTY_M42_ROOT");
+	    root_probe != nullptr && *root_probe == '1') {
+		static std::atomic<uint32_t> root_count {0};
+		const auto                   n = root_count.fetch_add(1);
+		if (n < 128 || (n & 0xfffu) == 0) {
+			std::fprintf(stderr,
+			             "m42-root: hash=0x%016" PRIx64 " root=0x%016" PRIx64
+			             " window=[0x%016" PRIx64 ",0x%016" PRIx64 ")\n",
+			             shader_hash, base, base, base + 32u * 4u);
+		}
+	}
 	// No writer has ever touched a watched table yet (intro/loading phases): there is no
 	// mailman on the street, so waiting can only stall the boot. The watcher unlocks the
 	// waits the moment it sees the first real write cycle.
