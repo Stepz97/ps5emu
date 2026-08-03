@@ -240,6 +240,12 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	}
 
 	if (graphics_debug_dump_enabled()) {
+		// The parameter dump alone cannot be attributed to a shader, which is exactly what a
+		// coverage investigation needs; name the program before dumping its workgroup shape.
+		if (input_info.stage.program != nullptr) {
+			LOGF("ShaderDbgDumpInputInfo: compute shader=0x%016" PRIx64 "\n",
+			     input_info.stage.program->shader_hash);
+		}
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
