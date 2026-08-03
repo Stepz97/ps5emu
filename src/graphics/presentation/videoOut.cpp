@@ -604,6 +604,14 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 // Gated behind --dump-scanout <path>; a no-op when the configured path is empty.
 // m42-dump (TEMPORARY, remove before commit): pull a watched cache image back to guest
 // memory and write it out as PPM, so pixel analysis does not depend on an unlocked desktop.
+//
+// ⚠️ STRUCTURE ONLY, NEVER GEOMETRY. Guest memory holds the TILED layout, and this writes it
+// row by row without detiling, so the PPM comes out as horizontal bands. It answers "does
+// this buffer hold data, and does it change between frames" (compare file hashes). It does
+// NOT answer "which region of the image is written": any coverage percentage computed on
+// this output measures the tiling pattern, which is structurally constant, and will happily
+// return the same number for experiments that genuinely differ. Measure geometry on a
+// screen capture, or detile first (see TileManager::Detile).
 static void DumpWatchedImage(const Graphics::ImageInfo& info) {
 	static const std::string path = []() -> std::string {
 		const char* v = std::getenv("KYTY_M42_DUMP_PATH");
