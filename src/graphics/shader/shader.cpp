@@ -1167,6 +1167,35 @@ static bool M42WaitForSrtTable(const HW::ComputeShaderInfo& regs, uint64_t shade
 	// outside this window the check cannot see it -- which would explain the ~1/3 of degraded
 	// walks that report a "filled" table. Logging the root base next to the shader hash is what
 	// tests that, so print it and let the arithmetic decide rather than assuming.
+	// m42-banks (TEMPORARY, remove before commit): the guest replicates this table across three
+	// ring banks 0x1800000 apart, and the pointer at slot 0 of the bank the SGPRs point at is
+	// always zero. If the rotation is ahead of the SGPRs, a sibling bank would hold the real
+	// pointer and the walk is simply reading a retired bank. Read slot 0 of all three and let
+	// the values decide, instead of assuming the one the SGPRs name is the live one.
+	if (const char* banks_probe = std::getenv("KYTY_M42_BANKS");
+	    banks_probe != nullptr && *banks_probe == '1') {
+		static std::atomic<uint32_t> banks_count {0};
+		const auto                   n = banks_count.fetch_add(1);
+		if (n < 64 || (n & 0xfffu) == 0) {
+			constexpr uint64_t kBankStride = 0x1800000;
+			char               line[512];
+			int                off = std::snprintf(line, sizeof(line),
+			                                       "m42-banks: hash=0x%016" PRIx64 " sgpr=0x%010" PRIx64,
+			                                       shader_hash, base);
+			for (int b = -1; b <= 1; b++) {
+				const uint64_t bank = base + static_cast<uint64_t>(b) * kBankStride;
+				uint32_t       lo = 0;
+				uint32_t       hi = 0;
+				const bool     ok = ShaderReadGuestMemory(nullptr, bank, &lo) &&
+				                ShaderReadGuestMemory(nullptr, bank + 4, &hi);
+				off += std::snprintf(line + off, sizeof(line) - off, " | %+d 0x%010" PRIx64 " slot0=",
+				                     b, bank);
+				off += ok ? std::snprintf(line + off, sizeof(line) - off, "0x%08x%08x", hi, lo)
+				          : std::snprintf(line + off, sizeof(line) - off, "<unreadable>");
+			}
+			std::fprintf(stderr, "%s\n", line);
+		}
+	}
 	if (const char* root_probe = std::getenv("KYTY_M42_ROOT");
 	    root_probe != nullptr && *root_probe == '1') {
 		static std::atomic<uint32_t> root_count {0};
