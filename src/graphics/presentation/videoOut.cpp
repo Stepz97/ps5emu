@@ -30,6 +30,10 @@ bool HostMovieActive();
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <string>
 #include <list>
 #include <thread>
 #include <span>
@@ -598,6 +602,67 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 // time a non-special flip is prepared, so its byte layout can be inspected outside the
 // Metal/MoltenVK swapchain (screencapture cannot capture the CAMetalLayer contents).
 // Gated behind --dump-scanout <path>; a no-op when the configured path is empty.
+// m42-dump (TEMPORARY, remove before commit): pull a watched cache image back to guest
+// memory and write it out as PPM, so pixel analysis does not depend on an unlocked desktop.
+static void DumpWatchedImage(const Graphics::ImageInfo& info) {
+	static const std::string path = []() -> std::string {
+		const char* v = std::getenv("KYTY_M42_DUMP_PATH");
+		return v != nullptr ? std::string(v) : std::string();
+	}();
+	if (path.empty() || info.data.address == 0 || info.extent.width == 0 ||
+	    info.extent.height == 0 || info.bytes_per_block < 2) {
+		return;
+	}
+	if (!Libs::LibKernel::Memory::SynchronizeGpuImageToMemory(info.data.address,
+	                                                          info.data.size)) {
+		return;
+	}
+	const auto* base        = reinterpret_cast<const uint8_t*>(info.data.address);
+	const auto  width       = info.extent.width;
+	const auto  height      = info.extent.height;
+	const auto  pitch_bytes = static_cast<uint64_t>(info.pitch) * info.bytes_per_block;
+	const auto  temp        = path + ".tmp";
+	FILE*       file        = fopen(temp.c_str(), "wb");
+	if (file == nullptr) {
+		return;
+	}
+	fprintf(file, "P6\n%u %u\n255\n", width, height);
+	// Half-float (RGBA16F) and 8-bit paths cover the buffers under investigation; anything
+	// else goes out as raw low bytes, which still shows structure.
+	const bool half = info.bytes_per_block == 8;
+	for (uint32_t row = 0; row < height; row++) {
+		const uint8_t* row_ptr = base + static_cast<uint64_t>(row) * pitch_bytes;
+		for (uint32_t col = 0; col < width; col++) {
+			const uint8_t* pixel = row_ptr + static_cast<uint64_t>(col) * info.bytes_per_block;
+			uint8_t        rgb[3] = {0, 0, 0};
+			if (half) {
+				for (int c = 0; c < 3; c++) {
+					uint16_t h = 0;
+					std::memcpy(&h, pixel + c * 2, sizeof(h));
+					const uint32_t exp  = (h >> 10u) & 0x1fu;
+					const uint32_t mant = h & 0x3ffu;
+					float          v    = 0.0f;
+					if (exp == 0) {
+						v = static_cast<float>(mant) / 1024.0f / 16384.0f;
+					} else {
+						v = std::ldexp(1.0f + static_cast<float>(mant) / 1024.0f,
+						               static_cast<int>(exp) - 15);
+					}
+					const float tone = v / (v + 1.0f); // Reinhard, keeps HDR readable
+					rgb[c] = static_cast<uint8_t>(std::min(255.0f, tone * 255.0f));
+				}
+			} else {
+				rgb[0] = pixel[0];
+				rgb[1] = info.bytes_per_block > 1 ? pixel[1] : pixel[0];
+				rgb[2] = info.bytes_per_block > 2 ? pixel[2] : pixel[0];
+			}
+			fwrite(rgb, 1, 3, file);
+		}
+	}
+	fclose(file);
+	std::rename(temp.c_str(), path.c_str());
+}
+
 static void DumpScanOutFrameOnce(const Graphics::ImageInfo& info) {
 	const auto path = Config::GetDumpScanOutPath();
 	if (path.empty()) {
@@ -1149,7 +1214,31 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 					     request_id, index, surface.group_index);
 				}
 				source_info = cfg->groups[surface.group_index].ImageInfo(surface);
-				DumpScanOutFrameOnce(source_info);
+					DumpScanOutFrameOnce(source_info);
+					// m42-dump (TEMPORARY, remove before commit): dump the cache image at
+					// KYTY_M42_DUMP_BASE to KYTY_M42_DUMP_PATH as PPM, every Nth flip.
+					// Screen captures need an unlocked desktop; this reads the pixels
+					// straight out of the watched buffer, so analysis works headless.
+					static const uint64_t dump_base = []() -> uint64_t {
+						const char* v = std::getenv("KYTY_M42_DUMP_BASE");
+						return v != nullptr ? std::strtoull(v, nullptr, 16) : 0;
+					}();
+					if (dump_base != 0) {
+						static std::atomic<uint32_t> dump_tick {0};
+						static const uint32_t        dump_every = []() -> uint32_t {
+                            const char* v = std::getenv("KYTY_M42_DUMP_EVERY");
+                            return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10))
+                                                                       : 64u;
+						}();
+						if ((dump_tick.fetch_add(1, std::memory_order_relaxed) % dump_every) == 0) {
+							auto& dump_cache = m_presenter.Renderer().GetTextureCache();
+							if (const auto id = dump_cache.M42FindLargestImageAt(dump_base); id) {
+								auto&              img = dump_cache.GetImage(id);
+								Graphics::ImageInfo di = img.info;
+								DumpWatchedImage(di);
+							}
+						}
+					}
 			}
 		}
 	}
